@@ -25,6 +25,10 @@ typedef struct BcPackContext BcPackContext;
 typedef enum BcPackFormat {
     BCPACK_FORMAT_BC1      = 0, // Full 12-lane rANS + predictor + quad reconstruction -> raw BC1 blocks (8B/block)
     BCPACK_FORMAT_BC7_RANS = 1, // 16-lane rANS entropy stage (100% Wave32) -> uint16[16] symbols/row (32B/row)
+    BCPACK_FORMAT_BC3      = 2, // Full 12-lane rANS + pair/quad/dict/history rebuild -> raw BC3 blocks (16B/block)
+    BCPACK_FORMAT_BC4      = 3, // Full 12-lane rANS + pair/dict/history rebuild -> raw BC4 blocks (8B/block)
+    BCPACK_FORMAT_BC5      = 4, // Full 12-lane rANS + pair/dict/history rebuild -> raw BC5 blocks (16B/block)
+    BCPACK_FORMAT_BC7      = 5, // Full 16-lane rANS + Modes 0..7 dict/history rebuild -> raw BC7 blocks (16B/block)
 } BcPackFormat;
 
 typedef enum BcPackSwizzle {
@@ -82,11 +86,11 @@ BCPACK_API int32_t BcPackDecodeToBuffer(
     uint64_t dst_byte_offset,
     uint64_t* out_fence_value);
 
-// Zero-copy async decode (+ optional Gfx10 detile) directly into a 2D DXGI_FORMAT_BC1_UNORM ID3D12Resource* subresource.
+// Zero-copy async decode (+ optional Gfx10 detile) directly into a 2D DXGI_FORMAT_BCn_UNORM ID3D12Resource* subresource.
 // - Executes BCPack decode (+ detile) on the Async Compute queue, performs GPU Queue::Wait onto DIRECT, and issues CopyTextureRegion
 //   (automatically padding row pitches to 256B for small mip levels).
 // - dst_texture2d MUST live on the shared device and enter in D3D12_RESOURCE_STATE_COMMON (restored to COMMON on exit).
-// - Signals *out_fence_value on BcPackGetDirectFence(ctx). Only BCPACK_FORMAT_BC1 is currently supported for direct Texture2D upload.
+// - Signals *out_fence_value on BcPackGetDirectFence(ctx). Supports BCPACK_FORMAT_BC1, BC3, BC4, BC5, and BC7.
 BCPACK_API int32_t BcPackDecodeToTexture2D(
     BcPackContext* ctx,
     const uint8_t* compressed_data,

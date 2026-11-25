@@ -18,15 +18,15 @@ Step-by-step drop-in recipes for clean-room Rust, DX12 C++ translation layers, a
        8388608,
        96u * 1024u * 1024u);
    ```
-3. On compressed texture requests targeting a guest `DXGI_FORMAT_BC1_UNORM` subresource (even Gfx10-swizzled):
+3. On compressed texture requests targeting a guest `DXGI_FORMAT_BC{1,3,4,5,7}_UNORM` subresource (even Gfx10-swizzled):
    ```cpp
    uint64_t fence = 0;
    BcPackDecodeToTexture2D(
        g_bcpack,
        src_bytes, src_len,
        width_blocks * height_blocks,
-       BCPACK_FORMAT_BC1,
-       is_4kb_s ? BCPACK_SWIZZLE_GFX10_4KB_S : BCPACK_SWIZZLE_GFX10_64KB_D,
+       BCPACK_FORMAT_BC7, // or BC1, BC3, BC4, BC5
+       BCPACK_SWIZZLE_GFX10_64KB_D,
        width_blocks, height_blocks,
        dst_tex2d, subresource_index,
        0, 0, &fence);
@@ -35,7 +35,7 @@ Step-by-step drop-in recipes for clean-room Rust, DX12 C++ translation layers, a
        fence);
    ```
 4. For raw linear buffer staging (`IDStorageQueueX` buffer destination), use `BcPackDecodeToBuffer(...)` and wait on `BcPackGetComputeFence(g_bcpack)`.
-5. For `BC7` streams (`BCPACK_FORMAT_BC7_RANS`), bind `shaders/bcpack_bc7_rans.dxil` followed by `shaders/bc16_pack.dxil` to collapse the `8 × uint` symbol rows into packed `16B` blocks (see [`src/gpu_decoder.rs`](../src/gpu_decoder.rs) `Bc16GpuStreamer`).
+5. Under Vulkan 1.3 (`OpenScarlett`), chain `bcpack_bcn_rans.spv -> bcpack_bcn_rebuild.spv` for `BC3`/`BC4`/`BC5` and `bcpack_bc7_rans.spv -> bcpack_bc7_rebuild.spv` for full Modes 0–7 `BC7` (total: **12 `.spv` kernels** in `shaders/spirv/`).
 
 ---
 

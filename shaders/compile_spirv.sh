@@ -10,7 +10,10 @@ mkdir -p "$OUT_DIR"
 
 SHADERS=(
   bcpack_decode
+  bcpack_bcn_rans
+  bcpack_bcn_rebuild
   bcpack_bc7_rans
+  bcpack_bc7_rebuild
   bc16_pack
   gfx10_detile
   hiz_build

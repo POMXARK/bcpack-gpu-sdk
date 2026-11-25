@@ -1,9 +1,9 @@
 [package]
 name = "bcpack-gpu-sdk"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Clean-room Xbox Series BCPack (MDU rANS) GPU Compute SDK: Zero-Copy DX12 C-ABI DLL, AMD Gfx10 Detiler, SM 6.6 Descriptor Pager, Compute RayQuery RTGI, VRS Tier 2 & Vulkan 1.3 SPIR-V Kernels"
+description = "Clean-room Xbox Series BCPack (MDU rANS) GPU Compute SDK: Zero-Copy DX12 C-ABI DLL (BC1/BC3/BC4/BC5/BC7), AMD Gfx10 Detiler, SM 6.6 Descriptor Pager, Compute RayQuery RTGI, VRS Tier 2 & Vulkan 1.3 SPIR-V Kernels"
 repository = "https://github.com/POMXARK/bcpack-gpu-sdk"
 homepage = "https://github.com/POMXARK/bcpack-gpu-sdk"
 readme = "README.md"
@@ -16,7 +16,7 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "b1c3099a3402de8b76c9263a828791bd8bc0c930", default-features = false }
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "f5145dda7fa6d1a22b499d82f3e63029713b71b6", default-features = false }
 
 [dependencies.windows]
 version = "0.58"
