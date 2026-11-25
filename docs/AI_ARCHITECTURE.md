@@ -1,4 +1,4 @@
-# `bcpack-gpu-sdk` — AI/LLM Machine-Readable Hardware SDK Architecture (`v0.12.0`)
+# `bcpack-gpu-sdk` — AI/LLM Machine-Readable Hardware SDK Architecture (`v0.13.0`)
 
 > **Target audience:** Coding agents, automated integration planners, and GPU systems engineers working on Xbox Series X|S translation layers (`xcl`, `OpenScarlett`, `AnyXboxX`), DirectStorage GPU hooks, or [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) backends.
 > **License & Provenance:** `MIT OR Apache-2.0`. 100% clean-room implementation derived from public specs (`Ahmet-Dedeler/bcpack-rs`, `microsoft/silicon-rans`). Zero proprietary game assets or SDK binaries.
@@ -9,11 +9,12 @@
 
 | Component | Path | Purpose | Entrypoints / Bindings |
 |---|---|---|---|
-| **C-ABI Header** | [`include/bcpack_gpu.h`](../include/bcpack_gpu.h) | Drop-in DX12 Async Compute + Direct upload API (`cdylib`, `BC1/BC3/BC4/BC5/BC7`) | `bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D`, `BcPackGetComputeFence`, `BcPackGetDirectFence`, `BcPackDecodeAsync` |
-| **FFI Wrapper** | [`src/ffi.rs`](../src/ffi.rs) | Thread-safe C-ABI implementation | `BcPackFormat::{Bc1=0, Bc7Rans=1, Bc3=2, Bc4=3, Bc5=4, Bc7=5}`, `BcPackSwizzle::{Linear=0, Gfx10_64KbD=1, Gfx10_4KbS=2}` |
-| **GPU Decoder Core** | [`src/gpu_decoder.rs`](../src/gpu_decoder.rs) | DX12 Device, `BcnGpuDecoder`, `Bc7FullGpuDecoder`, `BcpackGpuDecoder`, `Bc16GpuStreamer` | `BcnGpuDecoder`, `Bc7FullGpuDecoder`, `BcpackGpuDecoder`, `Gfx10DetileGpu`, `uav_barrier_all` |
-| **BCn Wave32 rANS** | [`shaders/bcpack_bcn_rans.hlsl`](../shaders/bcpack_bcn_rans.hlsl) | Generalized 12-lane Wave32 rANS for `BC3/BC4/BC5` (`24/32` lanes) | `[WaveSize(32)]`, `t0..t2`, `u0` (`uint` ×6/row), `u1` |
-| **BC3/4/5 Rebuilder** | [`shaders/bcpack_bcn_rebuild.hlsl`](../shaders/bcpack_bcn_rebuild.hlsl) | `BC3/BC4/BC5` pair/quad rank tables, 255 dict, 256 hist, `8B`/`16B` pack | `b0`, `t0..t4` (`g_Pairs`, `g_Quads`, `g_Dict`), `u0`, `u1` |
+| **C-ABI Header** | [`include/bcpack_gpu.h`](../include/bcpack_gpu.h) | Drop-in DX12 Async Compute + Direct upload API (`cdylib`, `BC1/3/4/5/6H/7`) | `bcpack_gpu_create_from_device`, `bcpack_gpu_set_{bc1,bc6h,bc7}_tables`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D`, `BcPackDecodeAsync` |
+| **FFI Wrapper** | [`src/ffi.rs`](../src/ffi.rs) | Thread-safe C-ABI implementation | `BcPackFormat::{Bc1=0, Bc7Rans=1, Bc3=2, Bc4=3, Bc5=4, Bc7=5, Bc6h=6}`, `BcPackSwizzle::{Linear=0, Gfx10_64KbD=1, Gfx10_4KbS=2}` |
+| **GPU Decoder Core** | [`src/gpu_decoder.rs`](../src/gpu_decoder.rs) | DX12 Device, `BcnGpuDecoder`, `Bc6hFullGpuDecoder`, `Bc7FullGpuDecoder`, `BcpackGpuDecoder` | `BcnGpuDecoder`, `Bc6hFullGpuDecoder`, `Bc7FullGpuDecoder`, `BcpackGpuDecoder`, `Gfx10DetileGpu`, `uav_barrier_all` |
+| **BCn Wave32 rANS** | [`shaders/bcpack_bcn_rans.hlsl`](../shaders/bcpack_bcn_rans.hlsl) | Generalized 12-lane Wave32 rANS for `BC1/BC3/BC4/BC5` (`24/32` lanes) | `[WaveSize(32)]`, `t0..t2`, `u0` (`uint` ×6/row), `u1` |
+| **BC1/3/4/5 Rebuilder** | [`shaders/bcpack_bcn_rebuild.hlsl`](../shaders/bcpack_bcn_rebuild.hlsl) | `BC1/BC3/BC4/BC5` pair/quad rank tables, 255 dict, 256 hist, `8B`/`16B` pack | `b0`, `t0..t4` (`g_Pairs`, `g_Quads`, `g_Dict`), `u0`, `u1` |
+| **BC6H Wave32 rANS & Rebuilder** | [`shaders/bcpack_bc6h_rans.hlsl`](../shaders/bcpack_bc6h_rans.hlsl), [`shaders/bcpack_bc6h_rebuild.hlsl`](../shaders/bcpack_bc6h_rebuild.hlsl) | 16-lane Wave32 rANS (`32/32`) + Full **BC6H (Modes 1–14)** 255 dict/hist | `b0`, `t0..t2` (`g_Dict`), `u0` (`uint4`), `u1` |
 | **Full BC7 Rebuilder** | [`shaders/bcpack_bc7_rebuild.hlsl`](../shaders/bcpack_bc7_rebuild.hlsl) | Multi-Mode **BC7 (Modes 0–7)** 512 controls, rot/p-bits/anchors, 255 dict | `b0`, `t0..t3` (`g_Controls`, `g_Dict`), `u0` (`uint4`), `u1` |
 | **Descriptor Pager** | [`src/descriptor_paging.rs`](../src/descriptor_paging.rs), [`shaders/bindless_paging.hlsl`](../shaders/bindless_paging.hlsl) | Virtual `1,250,000` SRVs paged onto `262,144` physical Tier-3 slots | `VirtualDescriptorPager`, `ResourceDescriptorHeap[NonUniformResourceIndex(phys)]` |
 | **Crowd Skinning** | [`src/crowd_skinning.rs`](../src/crowd_skinning.rs), [`shaders/crowd_skin.hlsl`](../shaders/crowd_skin.hlsl) | `500` NPCs × 4-bone Linear Blend Skinning Compute pass | `t0` (`BaseSkinnedVertex`), `t1` (`BoneMat`), `u0` (`OutSkinnedVertex`), `b0` (`CrowdCB`) |

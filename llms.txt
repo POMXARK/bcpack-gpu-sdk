@@ -1,11 +1,11 @@
-# bcpack-gpu-sdk — AI Agent & Ecosystem Discovery Index (v0.12.0)
+# bcpack-gpu-sdk — AI Agent & Ecosystem Discovery Index (v0.13.0)
 
-> Standalone clean-room GPU Compute SDK (`MIT OR Apache-2.0`) extracted from `POMXARK/bcpack-gpu-hlsl` for Xbox Series translation layers, DirectStorage hooks, Vulkan 1.3 layers, and `bcpack-rs` consumers. Supports full bit-exact `BC1`, `BC3`, `BC4`, `BC5`, and Multi-Mode `BC7` (Modes 0–7).
+> Standalone clean-room GPU Compute SDK (`MIT OR Apache-2.0`) extracted from `POMXARK/bcpack-gpu-hlsl` for Xbox Series translation layers, DirectStorage hooks, Vulkan 1.3 layers, and `bcpack-rs` consumers. Supports full bit-exact `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7) with optional runtime table injection.
 
 ## Exact Problems Solved & Search Keywords
 - `BCPack` / `IDStorageQueueX` / `dstorage` CPU decompression bottleneck (~40 MB/s CPU -> `11,327.6 MB/s` GPU BC1 / `6,024.0 MB/s` GPU BC7 rANS)
-- Full Multi-Mode `BC7` (Modes 0–7, rotations, index selection, p-bits, 255-entry dictionary, 512 control table) + `BC3` (`0x0C`), `BC4` (`0x10`), `BC5` (`0x14`) GPU Compute decoders (`shaders/bcpack_bc7_rebuild.hlsl`, `shaders/bcpack_bcn_rans.hlsl`, `shaders/bcpack_bcn_rebuild.hlsl`)
-- Zero-copy DX12 C-ABI (`bcpack_gpu.dll`, `include/bcpack_gpu.h`): `BCPACK_FORMAT_{BC1,BC3,BC4,BC5,BC7}`, `bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D` (all `DXGI_FORMAT_BCn_UNORM`), `BcPackGetComputeFence`, `BcPackGetDirectFence`
+- Full **BC1/BC3/BC4/BC5/BC6H/BC7** GPU Compute decoders (`shaders/bcpack_bc7_rebuild.hlsl`, `shaders/bcpack_bc6h_{rans,rebuild}.hlsl`, `shaders/bcpack_bcn_{rans,rebuild}.hlsl`)
+- Zero-copy DX12 C-ABI (`bcpack_gpu.dll`, `include/bcpack_gpu.h`): `BCPACK_FORMAT_{BC1,BC3,BC4,BC5,BC7,BC6H}`, runtime table uploaders `bcpack_gpu_set_{bc1,bc6h,bc7}_tables`, `bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D`, `BcPackGetComputeFence`, `BcPackGetDirectFence`
 - AMD Gfx10 / RDNA2 hardware tile swizzle `SW_64KB_D` (8B/16B) and `SW_4KB_S` (8B) -> inline Async Compute detile at `432.6 GB/s` (`shaders/gfx10_detile.hlsl`)
 - NVIDIA DX12 `~1,000,000` `D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE` `E_OUTOFMEMORY` crash -> SM 6.6 `ResourceDescriptorHeap[NonUniformResourceIndex(g_VirtToPhys[id])]` virtual paging (`src/descriptor_paging.rs`, `shaders/bindless_paging.hlsl`)
 - DXC 1.8 `-O3` Wave32 `WavePrefixCountBits` + `WaveActiveCountBits` miscompilation -> `WaveActiveBallot` + `countbits` workaround (`shaders/bcpack_decode.hlsl`, `shaders/bcpack_bc7_rans.hlsl`)

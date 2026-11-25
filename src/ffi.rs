@@ -1,7 +1,7 @@
 use crate::gpu_decoder::{
     cmd_barriers, create_committed_buffer, pack_batch, pack_bcn_batch, transition_barrier,
-    Bc7FullGpuDecoder, Bc7RansGpuDecoder, BcnGpuDecoder, BcpackGpuDecoder, Gfx10DetileGpu,
-    GpuContext,
+    Bc6hFullGpuDecoder, Bc7FullGpuDecoder, Bc7RansGpuDecoder, BcnGpuDecoder, BcpackGpuDecoder,
+    Gfx10DetileGpu, GpuContext,
 };
 use bcpack::bc1::{QuadTable, Window};
 use bcpack::format::Mode as BcpMode;
@@ -13,7 +13,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC4_UNORM,
-    DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC7_UNORM,
+    DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC6H_UF16, DXGI_FORMAT_BC7_UNORM,
 };
 use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
@@ -23,6 +23,7 @@ pub const BCPACK_FORMAT_BC3: u32 = 2;
 pub const BCPACK_FORMAT_BC4: u32 = 3;
 pub const BCPACK_FORMAT_BC5: u32 = 4;
 pub const BCPACK_FORMAT_BC7: u32 = 5;
+pub const BCPACK_FORMAT_BC6H: u32 = 6;
 
 pub const BCPACK_SWIZZLE_LINEAR: u32 = 0;
 pub const BCPACK_SWIZZLE_GFX10_64KB_D: u32 = 1;
@@ -34,6 +35,8 @@ pub struct BcPackContext {
     bc7_dec: Bc7RansGpuDecoder,
     bcn_dec: BcnGpuDecoder,
     bc7_full: Bc7FullGpuDecoder,
+    bc6h_full: Bc6hFullGpuDecoder,
+    bc1_use_full_bcn: bool,
     detile: Gfx10DetileGpu,
     detile_out_default: ID3D12Resource,
     detile_readback: ID3D12Resource,
@@ -54,6 +57,7 @@ fn format_layout(format: u32) -> Option<(usize, DXGI_FORMAT)> {
         BCPACK_FORMAT_BC4 => Some((8, DXGI_FORMAT_BC4_UNORM)),
         BCPACK_FORMAT_BC5 => Some((16, DXGI_FORMAT_BC5_UNORM)),
         BCPACK_FORMAT_BC7 => Some((16, DXGI_FORMAT_BC7_UNORM)),
+        BCPACK_FORMAT_BC6H => Some((16, DXGI_FORMAT_BC6H_UF16)),
         _ => None,
     }
 }
@@ -71,6 +75,7 @@ fn detile_mode_for(block_bytes: usize, swizzle_mode: u32) -> Result<u32, i32> {
 #[inline]
 fn bcn_mode_from_format(format: u32) -> Option<BcpMode> {
     match format {
+        BCPACK_FORMAT_BC1 => Some(BcpMode::Bc1),
         BCPACK_FORMAT_BC3 => Some(BcpMode::Bc3),
         BCPACK_FORMAT_BC4 => Some(BcpMode::Bc4),
         BCPACK_FORMAT_BC5 => Some(BcpMode::Bc5),
@@ -100,6 +105,7 @@ unsafe fn init_context_with_gpu(
     let bc7_dec = Bc7RansGpuDecoder::new(&mut ctx, chunks, bc7_sym_rows, stream_cap);
     let bcn_dec = BcnGpuDecoder::new(&mut ctx, chunks, bc7_sym_rows, out_bytes, stream_cap);
     let bc7_full = Bc7FullGpuDecoder::new(&mut ctx, chunks, (out_bytes / 16).max(4096), stream_cap);
+    let bc6h_full = Bc6hFullGpuDecoder::new(&mut ctx, chunks, (out_bytes / 16).max(4096), stream_cap);
     let detile = Gfx10DetileGpu::new(&ctx, 16 * 1024 * 1024);
     let detile_out_default = create_committed_buffer(
         &ctx.device,
@@ -148,6 +154,8 @@ unsafe fn init_context_with_gpu(
         bc7_dec,
         bcn_dec,
         bc7_full,
+        bc6h_full,
+        bc1_use_full_bcn: false,
         detile,
         detile_out_default,
         detile_readback,
@@ -213,6 +221,101 @@ pub unsafe extern "C" fn bcpack_gpu_destroy(ctx: *mut BcPackContext) {
             drop(state);
         }));
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bcpack_gpu_set_bc1_tables(
+    ctx: *mut BcPackContext,
+    rank1_256: *const u8,
+    dict_ep_255x6: *const u8,
+    dict_ix_255x16: *const u8,
+) -> i32 {
+    if ctx.is_null() || rank1_256.is_null() || dict_ep_255x6.is_null() || dict_ix_255x16.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| -> i32 {
+        let state = &mut *ctx;
+        if state.ctx.compute_fence_value > 0 {
+            let _ = state.ctx.wait_compute_cpu(state.ctx.compute_fence_value, INFINITE);
+        }
+        let r1: &[u8; 256] = &*(rank1_256 as *const [u8; 256]);
+        let ep = std::slice::from_raw_parts(dict_ep_255x6, 255 * 6);
+        let ix = std::slice::from_raw_parts(dict_ix_255x16, 255 * 16);
+        state.bcn_dec.update_bc1_tables(&mut state.ctx, r1, ep, ix);
+        state.bc1_use_full_bcn = true;
+        0
+    }));
+    res.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bcpack_gpu_set_bc7_tables(
+    ctx: *mut BcPackContext,
+    ctrl7_512: *const u16,
+    dict_subsets_255: *const u8,
+    dict_ep8_255x24: *const u8,
+    dict_ix4_255x32: *const u8,
+) -> i32 {
+    if ctx.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| -> i32 {
+        let state = &mut *ctx;
+        if state.ctx.compute_fence_value > 0 {
+            let _ = state.ctx.wait_compute_cpu(state.ctx.compute_fence_value, INFINITE);
+        }
+        let ctls = if ctrl7_512.is_null() {
+            None
+        } else {
+            Some(&*(ctrl7_512 as *const [u16; 512]))
+        };
+        let subs = if dict_subsets_255.is_null() {
+            None
+        } else {
+            Some(&*(dict_subsets_255 as *const [u8; 255]))
+        };
+        let ep8 = if dict_ep8_255x24.is_null() {
+            None
+        } else {
+            Some(std::slice::from_raw_parts(dict_ep8_255x24, 255 * 24))
+        };
+        let ix4 = if dict_ix4_255x32.is_null() {
+            None
+        } else {
+            Some(std::slice::from_raw_parts(dict_ix4_255x32, 255 * 32))
+        };
+        state.bc7_full.update_tables(&mut state.ctx, ctls, subs, ep8, ix4);
+        0
+    }));
+    res.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bcpack_gpu_set_bc6h_tables(
+    ctx: *mut BcPackContext,
+    dict_ep16_255x12: *const u16,
+    dict_ix_mode_255: *const u8,
+    dict_ix16_255x16: *const i16,
+) -> i32 {
+    if ctx.is_null()
+        || dict_ep16_255x12.is_null()
+        || dict_ix_mode_255.is_null()
+        || dict_ix16_255x16.is_null()
+    {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| -> i32 {
+        let state = &mut *ctx;
+        if state.ctx.compute_fence_value > 0 {
+            let _ = state.ctx.wait_compute_cpu(state.ctx.compute_fence_value, INFINITE);
+        }
+        let ep16 = std::slice::from_raw_parts(dict_ep16_255x12, 255 * 12);
+        let ix_mode: &[u8; 255] = &*(dict_ix_mode_255 as *const [u8; 255]);
+        let ix16 = std::slice::from_raw_parts(dict_ix16_255x16, 255 * 16);
+        state.bc6h_full.update_tables(&mut state.ctx, ep16, ix_mode, ix16);
+        0
+    }));
+    res.unwrap_or(-99)
 }
 
 #[no_mangle]
@@ -283,7 +386,7 @@ unsafe fn submit_format_compute_to_internal(
         return Err(-5);
     }
 
-    let (decoded_res, mut compute_val) = if format == BCPACK_FORMAT_BC1 {
+    let (decoded_res, mut compute_val) = if format == BCPACK_FORMAT_BC1 && !state.bc1_use_full_bcn {
         let batch = pack_batch(std::iter::once((stream, num_blocks as usize)));
         let fv = state.bc1_dec.submit_async_compute(&mut state.ctx, &batch);
         state.last_kernel_ms = 0.0;
@@ -293,6 +396,11 @@ unsafe fn submit_format_compute_to_internal(
         let batch = pack_batch(std::iter::once((stream, sym_rows)));
         let fv = state.bc7_full.submit_async_compute(&mut state.ctx, &batch);
         (state.bc7_full.out_blocks_default.clone(), fv)
+    } else if format == BCPACK_FORMAT_BC6H {
+        let sym_rows = (num_blocks as usize) * 2;
+        let batch = pack_batch(std::iter::once((stream, sym_rows)));
+        let fv = state.bc6h_full.submit_async_compute(&mut state.ctx, &batch);
+        (state.bc6h_full.out_blocks_default.clone(), fv)
     } else {
         let m = bcn_mode_from_format(format).ok_or(-4)?;
         let batch = pack_bcn_batch(std::iter::once((stream, m, num_blocks as usize)));
@@ -414,7 +522,7 @@ pub unsafe extern "C" fn BcPackDecodeAsync(
 
         if !need_detile && !out_host_buffer.is_null() {
             let (decoded, statuses, kms) = match format {
-                BCPACK_FORMAT_BC1 => {
+                BCPACK_FORMAT_BC1 if !state.bc1_use_full_bcn => {
                     let batch = pack_batch(std::iter::once((stream, num_blocks as usize)));
                     let (d, st, k, _) = state.bc1_dec.decode_batch_and_readback(&mut state.ctx, &batch);
                     (d, st, k)
@@ -422,6 +530,11 @@ pub unsafe extern "C" fn BcPackDecodeAsync(
                 BCPACK_FORMAT_BC7 => {
                     let batch = pack_batch(std::iter::once((stream, (num_blocks as usize) * 2)));
                     let (d, st, k, _) = state.bc7_full.decode_batch_and_readback(&mut state.ctx, &batch);
+                    (d, st, k)
+                }
+                BCPACK_FORMAT_BC6H => {
+                    let batch = pack_batch(std::iter::once((stream, (num_blocks as usize) * 2)));
+                    let (d, st, k, _) = state.bc6h_full.decode_batch_and_readback(&mut state.ctx, &batch);
                     (d, st, k)
                 }
                 _ => {
@@ -484,8 +597,9 @@ pub unsafe extern "C" fn BcPackDecodeAsync(
         state.detile_readback.Unmap(0, None);
 
         state.last_kernel_ms = match format {
-            BCPACK_FORMAT_BC1 => state.bc1_dec.read_last_kernel_ms(&state.ctx),
+            BCPACK_FORMAT_BC1 if !state.bc1_use_full_bcn => state.bc1_dec.read_last_kernel_ms(&state.ctx),
             BCPACK_FORMAT_BC7 => state.bc7_full.read_last_kernel_ms(&state.ctx),
+            BCPACK_FORMAT_BC6H => state.bc6h_full.read_last_kernel_ms(&state.ctx),
             _ => state.bcn_dec.read_last_kernel_ms(&state.ctx),
         };
         if !out_fence_value.is_null() {

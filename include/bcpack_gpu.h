@@ -29,6 +29,7 @@ typedef enum BcPackFormat {
     BCPACK_FORMAT_BC4      = 3, // Full 12-lane rANS + pair/dict/history rebuild -> raw BC4 blocks (8B/block)
     BCPACK_FORMAT_BC5      = 4, // Full 12-lane rANS + pair/dict/history rebuild -> raw BC5 blocks (16B/block)
     BCPACK_FORMAT_BC7      = 5, // Full 16-lane rANS + Modes 0..7 dict/history rebuild -> raw BC7 blocks (16B/block)
+    BCPACK_FORMAT_BC6H     = 6, // Full 16-lane rANS + Modes 1..14 dict/history rebuild -> raw BC6H blocks (16B/block)
 } BcPackFormat;
 
 typedef enum BcPackSwizzle {
@@ -56,6 +57,28 @@ BCPACK_API BcPackContext* bcpack_gpu_create_from_device(
 
 // Destroys the DX12 context and frees GPU heaps/queues.
 BCPACK_API void bcpack_gpu_destroy(BcPackContext* ctx);
+
+// Uploads caller-supplied full BC1 rank1 (256B) + dictionary (255 x 6B ep + 255 x 16B ix) tables and switches BCPACK_FORMAT_BC1 to full history/ix_ref/dictionary rebuild. Returns 0 on success.
+BCPACK_API int32_t bcpack_gpu_set_bc1_tables(
+    BcPackContext* ctx,
+    const uint8_t* rank1_256,
+    const uint8_t* dict_ep_255x6,
+    const uint8_t* dict_ix_255x16);
+
+// Uploads caller-supplied BC7 control words (512 x uint16) and/or 255-entry top-aligned dictionary (subsets[255], ep[255*24], ix[255*32]). Returns 0 on success.
+BCPACK_API int32_t bcpack_gpu_set_bc7_tables(
+    BcPackContext* ctx,
+    const uint16_t* ctrl7_512,
+    const uint8_t* dict_subsets_255,
+    const uint8_t* dict_ep8_255x24,
+    const uint8_t* dict_ix4_255x32);
+
+// Uploads caller-supplied BC6H 255-entry dictionary (ep[255*12] uint16 left-aligned, ix_mode[255] uint8, ix[255*16] int16). Returns 0 on success.
+BCPACK_API int32_t bcpack_gpu_set_bc6h_tables(
+    BcPackContext* ctx,
+    const uint16_t* dict_ep16_255x12,
+    const uint8_t* dict_ix_mode_255,
+    const int16_t* dict_ix16_255x16);
 
 // Returns the underlying ID3D12Fence* signaled by the compute queue after BcPackDecodeToBuffer / BcPackDecodeAsync
 // so callers can execute GPU-side direct_queue->Wait((ID3D12Fence*)BcPackGetComputeFence(ctx), fence_value) without CPU stalls.

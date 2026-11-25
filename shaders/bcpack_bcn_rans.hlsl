@@ -15,7 +15,7 @@ struct ChunkDesc {
     uint stream_len;
     uint rows;           // out_target symbols per lane (blocks for BC4, 2 * blocks for BC3/BC5)
     uint out_row_offset; // starting symbol-row index in g_OutSyms (1 row = 6 uints = 12 uint16)
-    uint mode;           // 0 = BC3, 1 = BC4, 2 = BC5
+    uint mode;           // 0 = BC3, 1 = BC4, 2 = BC5, 3 = BC1
     uint _pad0;
     uint _pad1;
     uint _pad2;
@@ -38,10 +38,11 @@ static const uint DRAIN = 5u;
 static const uint RANS_L = 0x01000000u;
 
 // Exact 12-lane alphabet widths from Ahmet-Dedeler/bcpack-rs (src/format.rs):
-static const uint BCN_ALPHABET_BITS[3][12] = {
+static const uint BCN_ALPHABET_BITS[4][12] = {
     { 3u, 3u, 7u, 5u, 5u, 5u, 5u, 4u, 5u, 4u, 7u, 7u }, // BC3 (0x0C)
     { 7u, 7u, 7u, 7u, 5u, 5u, 5u, 5u, 5u, 5u, 5u, 5u }, // BC4 (0x10)
-    { 3u, 3u, 7u, 7u, 5u, 5u, 5u, 5u, 5u, 5u, 5u, 5u }  // BC5 (0x14)
+    { 3u, 3u, 7u, 7u, 5u, 5u, 5u, 5u, 5u, 5u, 5u, 5u }, // BC5 (0x14)
+    { 7u, 7u, 4u, 5u, 4u, 4u, 5u, 4u, 7u, 7u, 7u, 7u }  // BC1 (0x04)
 };
 
 groupshared uint lane_bf[10][24];
@@ -102,7 +103,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
     uint chunk_id = groupID.x * 2u + sub;
 
     ChunkDesc desc = g_Chunks[chunk_id];
-    uint m_idx = min(desc.mode, 2u);
+    uint m_idx = min(desc.mode, 3u);
 
     bool half_active = (desc.rows > 0u);
     bool lane_running = half_active && (ll < 12u);

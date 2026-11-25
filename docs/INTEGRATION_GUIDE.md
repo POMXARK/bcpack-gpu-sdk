@@ -18,14 +18,19 @@ Step-by-step drop-in recipes for clean-room Rust, DX12 C++ translation layers, a
        8388608,
        96u * 1024u * 1024u);
    ```
-3. On compressed texture requests targeting a guest `DXGI_FORMAT_BC{1,3,4,5,7}_UNORM` subresource (even Gfx10-swizzled):
+3. On compressed texture requests targeting a guest `DXGI_FORMAT_BC{1,3,4,5,6H_UF16,7}_UNORM` subresource (even Gfx10-swizzled):
    ```cpp
+   // Optional: upload caller BCPack tables at startup for full BC1/BC6H/BC7 dict/ctrl parity:
+   // bcpack_gpu_set_bc1_tables(...);
+   // bcpack_gpu_set_bc6h_tables(...);
+   // bcpack_gpu_set_bc7_tables(...);
+
    uint64_t fence = 0;
    BcPackDecodeToTexture2D(
        g_bcpack,
        src_bytes, src_len,
        width_blocks * height_blocks,
-       BCPACK_FORMAT_BC7, // or BC1, BC3, BC4, BC5
+       BCPACK_FORMAT_BC7, // or BC1, BC3, BC4, BC5, BC6H
        BCPACK_SWIZZLE_GFX10_64KB_D,
        width_blocks, height_blocks,
        dst_tex2d, subresource_index,
@@ -35,7 +40,7 @@ Step-by-step drop-in recipes for clean-room Rust, DX12 C++ translation layers, a
        fence);
    ```
 4. For raw linear buffer staging (`IDStorageQueueX` buffer destination), use `BcPackDecodeToBuffer(...)` and wait on `BcPackGetComputeFence(g_bcpack)`.
-5. Under Vulkan 1.3 (`OpenScarlett`), chain `bcpack_bcn_rans.spv -> bcpack_bcn_rebuild.spv` for `BC3`/`BC4`/`BC5` and `bcpack_bc7_rans.spv -> bcpack_bc7_rebuild.spv` for full Modes 0–7 `BC7` (total: **12 `.spv` kernels** in `shaders/spirv/`).
+5. Under Vulkan 1.3 (`OpenScarlett`), chain `bcpack_bcn_rans.spv -> bcpack_bcn_rebuild.spv` for `BC1`/`BC3`/`BC4`/`BC5`, `bcpack_bc6h_rans.spv -> bcpack_bc6h_rebuild.spv` for `BC6H` (Modes 1–14), and `bcpack_bc7_rans.spv -> bcpack_bc7_rebuild.spv` for full Modes 0–7 `BC7` (total: **14 `.spv` kernels** in `shaders/spirv/`).
 
 ---
 

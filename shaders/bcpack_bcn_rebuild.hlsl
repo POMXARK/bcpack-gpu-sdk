@@ -1,5 +1,5 @@
-// Clean-room Xbox Series BCPack (BC3 / BC4 / BC5) GPU Block Rebuilder (HLSL SM 6.6)
-// Exact bit-for-bit parity with Ahmet-Dedeler/bcpack-rs (src/bcn.rs).
+// Clean-room Xbox Series BCPack (BC1 / BC3 / BC4 / BC5) GPU Block Rebuilder (HLSL SM 6.6)
+// Exact bit-for-bit parity with Ahmet-Dedeler/bcpack-rs & DirectStorage BCPack format.
 // Dispatches 1 thread per chunk over the 6-uint/row symbols produced by bcpack_bcn_rans.hlsl.
 
 cbuffer BcnRebuildCB : register(b0) {
@@ -11,14 +11,14 @@ struct BcnChunkDesc {
     uint in_row_offset;
     uint blocks;
     uint out_byte_offset;
-    uint mode; // 0 = BC3, 1 = BC4, 2 = BC5
+    uint mode; // 0 = BC3, 1 = BC4, 2 = BC5, 3 = BC1
 };
 
 StructuredBuffer<uint>         g_InSyms : register(t0); // 6 uints (12 uint16) per row
 StructuredBuffer<BcnChunkDesc> g_Chunks : register(t1);
 StructuredBuffer<uint>         g_Pairs  : register(t2); // 3 * 64 entries: p0 | (p1 << 8)
-StructuredBuffer<uint>         g_Quads  : register(t3); // 256 entries: q0 | (q1<<8) | (q2<<16) | (q3<<24)
-StructuredBuffer<uint>         g_Dict   : register(t4); // 3 * 255 * 6 uints (packed State)
+StructuredBuffer<uint>         g_Quads  : register(t3); // 512 entries: 0..255 BC3, 256..511 BC1
+StructuredBuffer<uint>         g_Dict   : register(t4); // 4 * 255 * 6 uints (packed State)
 
 RWByteAddressBuffer            g_OutBlocks : register(u0); // 8B/block (BC4) or 16B/block (BC3/BC5)
 RWStructuredBuffer<uint>       g_Hist      : register(u1); // max_chunks * 256 * 6 uints
@@ -134,7 +134,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
 
     BcnChunkDesc desc = g_Chunks[chunk_id];
     uint mode = desc.mode;
-    uint pair_base = mode * 64u;
+    uint pair_base = min(mode, 2u) * 64u;
     uint hist_chunk_base = chunk_id * 256u * 6u;
 
     for (uint i = 0u; i < desc.blocks; ++i) {
@@ -190,6 +190,37 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
                 ix_w[(g0 + 1u) >> 3u]|= ((pr_ge >> 8u) & 7u)<< (((g0 + 1u) & 7u) * 4u);
                 ix_w[(g0 + 2u) >> 3u]|= (pr_go & 7u)        << (((g0 + 2u) & 7u) * 4u);
                 ix_w[(g0 + 3u) >> 3u]|= ((pr_go >> 8u) & 7u)<< (((g0 + 3u) & 7u) * 4u);
+            }
+        } else if (mode == 3u) {
+            // BC1: 1 symbol row per block (8B)
+            uint row = desc.in_row_offset + i;
+            decode_refs(read_sym(row, 0u), read_sym(row, 1u), er, xr);
+            ep[2] = residual_bits(read_sym(row, 2u), 5u);
+            ep[3] = residual_bits(read_sym(row, 3u), 6u);
+            ep[4] = residual_bits(read_sym(row, 4u), 5u);
+            ep[5] = residual_bits(read_sym(row, 5u), 5u);
+            ep[6] = residual_bits(read_sym(row, 6u), 6u);
+            ep[7] = residual_bits(read_sym(row, 7u), 5u);
+
+            uint qs[4] = {
+                read_sym(row, 8u)  & 255u,
+                read_sym(row, 9u)  & 255u,
+                read_sym(row, 10u) & 255u,
+                read_sym(row, 11u) & 255u
+            };
+            [unroll]
+            for (uint q = 0u; q < 4u; ++q) {
+                uint qv = g_Quads[256u + qs[q]];
+                uint ox = (q & 1u) * 2u;
+                uint oy = (q >> 1u) * 2u;
+                uint p00 = 16u + 4u * oy + ox;
+                uint p10 = p00 + 1u;
+                uint p01 = p00 + 4u;
+                uint p11 = p00 + 5u;
+                ix_w[p00 >> 3u] |= ((qv >> 0u)  & 3u) << ((p00 & 7u) * 4u);
+                ix_w[p10 >> 3u] |= ((qv >> 8u)  & 3u) << ((p10 & 7u) * 4u);
+                ix_w[p01 >> 3u] |= ((qv >> 16u) & 3u) << ((p01 & 7u) * 4u);
+                ix_w[p11 >> 3u] |= ((qv >> 24u) & 3u) << ((p11 & 7u) * 4u);
             }
         } else {
             // BC3: 2 symbol rows per block (16B)
@@ -247,7 +278,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         [unroll]
         for (uint e = 0u; e < 8u; ++e) {
             if (e < ne) {
-                uint m = (mode == 0u) ? EP_MASK_BC3[e] : 255u;
+                uint m = (mode == 0u || mode == 3u) ? EP_MASK_BC3[e] : 255u;
                 ep[e] = (ep[e] + get_ep_from_words(ref_ep[0], ref_ep[1], e)) & m;
             }
         }
@@ -319,6 +350,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
             uint2 a0 = pack_alpha(ep[0], ep[1], aw0);
             uint2 a1 = pack_alpha(ep[2], ep[3], aw1);
             g_OutBlocks.Store4(desc.out_byte_offset + i * 16u, uint4(a0.x, a0.y, a1.x, a1.y));
+        } else if (mode == 3u) {
+            uint cw[2] = { ix_w[2], ix_w[3] };
+            g_OutBlocks.Store2(desc.out_byte_offset + i * 8u, pack_colour(ep, cw));
         } else {
             uint aw[2] = { ix_w[0], ix_w[1] };
             uint cw[2] = { ix_w[2], ix_w[3] };

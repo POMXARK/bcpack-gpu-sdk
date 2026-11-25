@@ -20,9 +20,11 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFIN
 
 pub const DECODE_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_decode.dxil");
 pub const BC7_RANS_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_bc7_rans.dxil");
+pub const BC6H_RANS_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_bc6h_rans.dxil");
 pub const BCN_RANS_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_bcn_rans.dxil");
 pub const BCN_REBUILD_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_bcn_rebuild.dxil");
 pub const BC7_REBUILD_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_bc7_rebuild.dxil");
+pub const BC6H_REBUILD_CS_DXIL: &[u8] = include_bytes!("../shaders/bcpack_bc6h_rebuild.dxil");
 pub const BC16_PACK_CS_DXIL: &[u8] = include_bytes!("../shaders/bc16_pack.dxil");
 pub const GFX10_DETILE_CS_DXIL: &[u8] = include_bytes!("../shaders/gfx10_detile.dxil");
 
@@ -1068,6 +1070,24 @@ impl Bc7RansGpuDecoder {
         max_sym_rows: usize,
         max_stream_bytes: usize,
     ) -> Self {
+        Self::new_with_dxil(
+            ctx,
+            max_chunks,
+            max_sym_rows,
+            max_stream_bytes,
+            BC7_RANS_CS_DXIL,
+            "bcpack_bc7_rans.dxil",
+        )
+    }
+
+    pub fn new_with_dxil(
+        ctx: &mut GpuContext,
+        max_chunks: usize,
+        max_sym_rows: usize,
+        max_stream_bytes: usize,
+        dxil: &[u8],
+        label: &str,
+    ) -> Self {
         unsafe {
             // t0 = g_Models, t1 = g_Streams, t2 = g_Chunks, u0 = g_OutSyms, u1 = g_Status
             let mut params = [D3D12_ROOT_PARAMETER1::default(); 5];
@@ -1098,7 +1118,7 @@ impl Bc7RansGpuDecoder {
                 };
             }
             let root_sig = create_root_sig_from_params(&ctx.device, &params);
-            let pso = create_compute_pso(&ctx.device, &root_sig, BC7_RANS_CS_DXIL, "bcpack_bc7_rans.dxil");
+            let pso = create_compute_pso(&ctx.device, &root_sig, dxil, label);
 
             let models = build_packed_models();
             let models_size = (models.len() * size_of::<ModelDataGpu>()) as u64;
@@ -2016,6 +2036,55 @@ unsafe fn upload_static_srv<T: Copy>(ctx: &mut GpuContext, data: &[T]) -> ID3D12
     dst
 }
 
+unsafe fn update_srv_region<T: Copy>(
+    ctx: &mut GpuContext,
+    dst: &ID3D12Resource,
+    dst_byte_offset: u64,
+    data: &[T],
+) {
+    let bytes = (data.len() * size_of::<T>()) as u64;
+    if bytes == 0 {
+        return;
+    }
+    let up = create_committed_buffer(
+        &ctx.device,
+        D3D12_HEAP_TYPE_UPLOAD,
+        bytes.max(256),
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+    );
+    upload_slice(&up, data);
+    let alloc: ID3D12CommandAllocator = ctx
+        .device
+        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)
+        .expect("CreateCommandAllocator update SRV");
+    let cmd: ID3D12GraphicsCommandList = ctx
+        .device
+        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None)
+        .expect("CreateCommandList update SRV");
+    cmd_barriers(
+        &cmd,
+        vec![transition_barrier(
+            dst,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )],
+    );
+    cmd.CopyBufferRegion(dst, dst_byte_offset, &up, 0, bytes);
+    cmd_barriers(
+        &cmd,
+        vec![transition_barrier(
+            dst,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )],
+    );
+    cmd.Close().unwrap();
+    let lists = [Some(cmd.cast::<ID3D12CommandList>().unwrap())];
+    ctx.compute_queue.ExecuteCommandLists(&lists);
+    ctx.signal_and_wait_compute();
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BcnChunkDescGpu {
@@ -2053,7 +2122,8 @@ pub fn bcn_mode_id(mode: BcpMode) -> u32 {
         BcpMode::Bc3 => 0,
         BcpMode::Bc4 => 1,
         BcpMode::Bc5 => 2,
-        other => panic!("BcnGpuDecoder supports only BC3/BC4/BC5, got {:?}", other),
+        BcpMode::Bc1 => 3,
+        other => panic!("BcnGpuDecoder supports only BC1/BC3/BC4/BC5, got {:?}", other),
     }
 }
 
@@ -2129,8 +2199,8 @@ where
 fn pack_bcn_tables() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let modes = [BcpMode::Bc3, BcpMode::Bc4, BcpMode::Bc5];
     let mut pairs = vec![0u32; 3 * 64];
-    let mut quads = vec![0u32; 256];
-    let mut dict = vec![0u32; 3 * 255 * 6];
+    let mut quads = vec![0u32; 512]; // 0..255 BC3, 256..511 BC1 (caller-uploaded)
+    let mut dict = vec![0u32; 4 * 255 * 6]; // slots 0..2 = BC3/4/5, slot 3 = BC1 (caller-uploaded)
 
     for (mi, &m) in modes.iter().enumerate() {
         let t = bcp_bcn::Tables::default_for(m).expect("embedded BCn table");
@@ -2538,6 +2608,43 @@ impl BcnGpuDecoder {
         let _ = ctx.wait_compute_cpu(fence_val, INFINITE);
         (self.read_last_kernel_ms(ctx), t0.elapsed().as_secs_f64() * 1000.0)
     }
+
+    pub fn update_bc1_tables(
+        &mut self,
+        ctx: &mut GpuContext,
+        rank1: &[u8; 256],
+        dict_ep: &[u8],
+        dict_ix: &[u8],
+    ) {
+        assert!(dict_ep.len() >= 255 * 6 && dict_ix.len() >= 255 * 16);
+        let mut quads = vec![0u32; 256];
+        for (i, &r) in rank1.iter().enumerate() {
+            quads[i] = u32::from(r & 3)
+                | (u32::from((r >> 2) & 3) << 8)
+                | (u32::from((r >> 4) & 3) << 16)
+                | (u32::from((r >> 6) & 3) << 24);
+        }
+        let mut dict = vec![0u32; 255 * 6];
+        for k in 0..255 {
+            let base = k * 6;
+            let ep = &dict_ep[k * 6..(k + 1) * 6];
+            // BC1 uses ep[2..7] (RGB565 endpoints c0, c1); ep[0..1] unused.
+            dict[base] = (u32::from(ep[0]) << 16) | (u32::from(ep[1]) << 24);
+            dict[base + 1] = u32::from(ep[2])
+                | (u32::from(ep[3]) << 8)
+                | (u32::from(ep[4]) << 16)
+                | (u32::from(ep[5]) << 24);
+            let ix = &dict_ix[k * 16..(k + 1) * 16];
+            for (p, &v) in ix.iter().enumerate() {
+                let slot = 16 + p;
+                dict[base + 2 + (slot >> 3)] |= u32::from(v & 3) << ((slot & 7) * 4);
+            }
+        }
+        unsafe {
+            update_srv_region(ctx, &self.quads_buf, (256 * size_of::<u32>()) as u64, &quads);
+            update_srv_region(ctx, &self.dict_buf, (3 * 255 * 6 * size_of::<u32>()) as u64, &dict);
+        }
+    }
 }
 
 #[repr(C)]
@@ -2885,6 +2992,354 @@ impl Bc7FullGpuDecoder {
         let fence_val = self.submit_async_compute(ctx, batch);
         let _ = ctx.wait_compute_cpu(fence_val, INFINITE);
         (self.read_last_kernel_ms(ctx), t0.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    pub fn update_tables(
+        &mut self,
+        ctx: &mut GpuContext,
+        ctrl7: Option<&[u16; 512]>,
+        dict_subsets: Option<&[u8; 255]>,
+        dict_ep8: Option<&[u8]>,
+        dict_ix4: Option<&[u8]>,
+    ) {
+        if let Some(ctls) = ctrl7 {
+            let mut packed = vec![0u32; 512];
+            for (i, &c) in ctls.iter().enumerate() {
+                if c != 0 {
+                    let mode = u32::from(c & 7);
+                    let rot = u32::from((c >> 3) & 3);
+                    let sel = u32::from((c >> 5) & 1);
+                    let part = u32::from((c >> 8) & 63);
+                    packed[i] = 0x8000_0000u32 | mode | (part << 8) | (rot << 16) | (sel << 24);
+                }
+            }
+            unsafe {
+                update_srv_region(ctx, &self.controls_buf, 0, &packed);
+            }
+        }
+        if let (Some(subs), Some(ep8), Some(ix4)) = (dict_subsets, dict_ep8, dict_ix4) {
+            assert!(ep8.len() >= 255 * 24 && ix4.len() >= 255 * 32);
+            let mut dict = vec![0u32; 255 * 11];
+            for k in 0..255 {
+                let base = k * 11;
+                dict[base] = u32::from(subs[k]);
+                for j in 0..24 {
+                    dict[base + 1 + (j >> 2)] |= u32::from(ep8[k * 24 + j]) << ((j & 3) * 8);
+                }
+                for j in 0..32 {
+                    dict[base + 7 + (j >> 3)] |= u32::from(ix4[k * 32 + j] & 0xF) << ((j & 7) * 4);
+                }
+            }
+            unsafe {
+                update_srv_region(ctx, &self.dict_buf, 0, &dict);
+            }
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Bc6hRebuildChunkGpu {
+    pub in_row_offset: u32,
+    pub blocks: u32,
+    pub out_block_offset: u32,
+    pub _pad0: u32,
+}
+
+/// Async Compute GPU Decoder for Full BC6H (Modes 1..=14, `0x18`):
+/// chains `bcpack_bc6h_rans.dxil` (Wave32 16-lane rANS) -> `bcpack_bc6h_rebuild.dxil`.
+pub struct Bc6hFullGpuDecoder {
+    pub rans: Bc7RansGpuDecoder,
+    rebuild_root_sig: ID3D12RootSignature,
+    rebuild_pso: ID3D12PipelineState,
+
+    dict_buf: ID3D12Resource,
+
+    cap_chunks: usize,
+    cap_blocks: usize,
+
+    chunks_upload: ID3D12Resource,
+    chunks_default: ID3D12Resource,
+    hist_default: ID3D12Resource,
+    pub out_blocks_default: ID3D12Resource,
+    out_readback: ID3D12Resource,
+    status_readback: ID3D12Resource,
+    ts_query_heap: ID3D12QueryHeap,
+    ts_readback: ID3D12Resource,
+
+    cmd_alloc: ID3D12CommandAllocator,
+    cmd_list: ID3D12GraphicsCommandList,
+}
+
+impl Bc6hFullGpuDecoder {
+    pub fn new(
+        ctx: &mut GpuContext,
+        max_chunks: usize,
+        max_bc6h_blocks: usize,
+        max_stream_bytes: usize,
+    ) -> Self {
+        unsafe {
+            let max_sym_rows = max_bc6h_blocks * 2;
+            let rans = Bc7RansGpuDecoder::new_with_dxil(
+                ctx,
+                max_chunks,
+                max_sym_rows,
+                max_stream_bytes,
+                BC6H_RANS_CS_DXIL,
+                "bcpack_bc6h_rans.dxil",
+            );
+
+            let params = [
+                cb_param(0, 4),
+                srv_param(0),
+                srv_param(1),
+                srv_param(2),
+                uav_param(0),
+                uav_param(1),
+            ];
+            let rebuild_root_sig = create_root_sig_from_params(&ctx.device, &params);
+            let rebuild_pso = create_compute_pso(&ctx.device, &rebuild_root_sig, BC6H_REBUILD_CS_DXIL, "bcpack_bc6h_rebuild.dxil");
+
+            let mut init_dict = vec![0u32; 255 * 15];
+            for k in 0..255 {
+                init_dict[k * 15 + 6] = 11;
+            }
+            let dict_buf = upload_static_srv(ctx, &init_dict);
+
+            let padded_chunks = max_chunks + 2;
+            let rc_bytes = (padded_chunks * size_of::<Bc6hRebuildChunkGpu>()) as u64;
+            let chunks_upload = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_UPLOAD, rc_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let chunks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, rc_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            let hist_bytes = (padded_chunks * 256 * 15 * 4) as u64;
+            let hist_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, hist_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+            let out_bytes = (max_bc6h_blocks * 16).max(256) as u64;
+            let out_blocks_default = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_DEFAULT, out_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            let out_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, out_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let status_bytes = (padded_chunks * size_of::<ChunkStatusGpu>()) as u64;
+            let status_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, status_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let mut ts_query_heap: Option<ID3D12QueryHeap> = None;
+            ctx.device
+                .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut ts_query_heap)
+                .expect("CreateQueryHeap Bc6hFull");
+            let ts_query_heap = ts_query_heap.unwrap();
+            let ts_readback = create_committed_buffer(&ctx.device, D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let cmd_alloc: ID3D12CommandAllocator = ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let cmd_list: ID3D12GraphicsCommandList = ctx.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &cmd_alloc, None).unwrap();
+            cmd_list.Close().unwrap();
+
+            Self {
+                rans,
+                rebuild_root_sig,
+                rebuild_pso,
+                dict_buf,
+                cap_chunks: padded_chunks,
+                cap_blocks: max_bc6h_blocks,
+                chunks_upload,
+                chunks_default,
+                hist_default,
+                out_blocks_default,
+                out_readback,
+                status_readback,
+                ts_query_heap,
+                ts_readback,
+                cmd_alloc,
+                cmd_list,
+            }
+        }
+    }
+
+    pub fn update_tables(
+        &mut self,
+        ctx: &mut GpuContext,
+        dict_ep16: &[u16],
+        dict_ix_mode: &[u8; 255],
+        dict_ix16: &[i16],
+    ) {
+        assert!(dict_ep16.len() >= 255 * 12 && dict_ix16.len() >= 255 * 16);
+        let mut dict = vec![0u32; 255 * 15];
+        for k in 0..255 {
+            let base = k * 15;
+            for j in 0..12 {
+                dict[base + (j >> 1)] |= u32::from(dict_ep16[k * 12 + j]) << ((j & 1) * 16);
+            }
+            dict[base + 6] = u32::from(dict_ix_mode[k]);
+            for p in 0..16 {
+                dict[base + 7 + (p >> 1)] |= u32::from(dict_ix16[k * 16 + p] as u16) << ((p & 1) * 16);
+            }
+        }
+        unsafe {
+            update_srv_region(ctx, &self.dict_buf, 0, &dict);
+        }
+    }
+
+    fn build_rebuild_chunks(batch: &BatchPayload) -> Vec<Bc6hRebuildChunkGpu> {
+        let mut out_blk = 0u32;
+        batch.chunks[..batch.real_chunk_count]
+            .iter()
+            .map(|c| {
+                let blks = c.blocks / 2;
+                let rc = Bc6hRebuildChunkGpu {
+                    in_row_offset: c.out_block_offset,
+                    blocks: blks,
+                    out_block_offset: out_blk,
+                    _pad0: 0,
+                };
+                out_blk += blks;
+                rc
+            })
+            .collect()
+    }
+
+    unsafe fn record_full_dispatch(&self, cmd: &ID3D12GraphicsCommandList, batch: &BatchPayload, rchunks: &[Bc6hRebuildChunkGpu]) {
+        assert!(batch.real_chunk_count <= self.cap_chunks, "BC6H chunks capacity exceeded");
+        assert!(batch.total_blocks / 2 <= self.cap_blocks, "BC6H block capacity exceeded");
+        self.rans.upload_batch(batch);
+        upload_slice(&self.chunks_upload, rchunks);
+
+        let s_len = batch.stream_bytes.len() as u64;
+        let c_len = (batch.chunks.len() * size_of::<ChunkDescGpu>()) as u64;
+        let rc_len = (rchunks.len() * size_of::<Bc6hRebuildChunkGpu>()) as u64;
+
+        cmd_barriers(
+            cmd,
+            vec![
+                transition_barrier(&self.rans.streams_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                transition_barrier(&self.rans.chunks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                transition_barrier(&self.chunks_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                transition_barrier(&self.rans.out_syms_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                transition_barrier(&self.rans.status_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                transition_barrier(&self.hist_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ],
+        );
+        cmd.CopyBufferRegion(&self.rans.streams_default, 0, &self.rans.streams_upload, 0, s_len);
+        cmd.CopyBufferRegion(&self.rans.chunks_default, 0, &self.rans.chunks_upload, 0, c_len);
+        cmd.CopyBufferRegion(&self.chunks_default, 0, &self.chunks_upload, 0, rc_len);
+        cmd_barriers(
+            cmd,
+            vec![
+                transition_barrier(&self.rans.streams_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&self.rans.chunks_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                transition_barrier(&self.chunks_default, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            ],
+        );
+
+        cmd.EndQuery(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+
+        cmd.SetComputeRootSignature(&self.rans.root_sig);
+        cmd.SetPipelineState(&self.rans.pso);
+        cmd.SetComputeRootShaderResourceView(0, self.rans.models_buf.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(1, self.rans.streams_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(2, self.rans.chunks_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(3, self.rans.out_syms_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(4, self.rans.status_default.GetGPUVirtualAddress());
+        cmd.Dispatch((batch.chunks.len() / 2) as u32, 1, 1);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                uav_barrier(&self.rans.out_syms_default),
+                transition_barrier(&self.rans.out_syms_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            ],
+        );
+
+        let cb = [batch.real_chunk_count as u32, 0u32, 0u32, 0u32];
+        cmd.SetComputeRootSignature(&self.rebuild_root_sig);
+        cmd.SetPipelineState(&self.rebuild_pso);
+        cmd.SetComputeRoot32BitConstants(0, 4, cb.as_ptr() as *const c_void, 0);
+        cmd.SetComputeRootShaderResourceView(1, self.rans.out_syms_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(2, self.chunks_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootShaderResourceView(3, self.dict_buf.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(4, self.out_blocks_default.GetGPUVirtualAddress());
+        cmd.SetComputeRootUnorderedAccessView(5, self.hist_default.GetGPUVirtualAddress());
+        cmd.Dispatch(((batch.real_chunk_count + 63) / 64).max(1) as u32, 1, 1);
+
+        cmd.EndQuery(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+        cmd_barriers(
+            cmd,
+            vec![
+                transition_barrier(&self.rans.out_syms_default, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&self.rans.status_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&self.hist_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+                transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            ],
+        );
+    }
+
+    pub fn submit_async_compute(&mut self, ctx: &mut GpuContext, batch: &BatchPayload) -> u64 {
+        unsafe {
+            let rchunks = Self::build_rebuild_chunks(batch);
+            self.cmd_alloc.Reset().unwrap();
+            self.cmd_list.Reset(&self.cmd_alloc, None).unwrap();
+            self.record_full_dispatch(&self.cmd_list, batch, &rchunks);
+            self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
+            self.cmd_list.Close().unwrap();
+            let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            ctx.compute_queue.ExecuteCommandLists(&lists);
+            ctx.signal_compute()
+        }
+    }
+
+    pub fn read_last_kernel_ms(&self, ctx: &GpuContext) -> f64 {
+        unsafe {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            self.ts_readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut ptr)).unwrap();
+            let ts = std::slice::from_raw_parts(ptr as *const u64, 2);
+            let ticks = ts[1].saturating_sub(ts[0]);
+            self.ts_readback.Unmap(0, None);
+            (ticks as f64 / ctx.compute_timestamp_freq as f64) * 1000.0
+        }
+    }
+
+    pub fn decode_batch_and_readback(&mut self, ctx: &mut GpuContext, batch: &BatchPayload) -> (Vec<u8>, Vec<ChunkStatusGpu>, f64, f64) {
+        unsafe {
+            let t0 = std::time::Instant::now();
+            let rchunks = Self::build_rebuild_chunks(batch);
+            let out_bytes = ((batch.total_blocks / 2) * 16) as u64;
+            let status_bytes = (batch.real_chunk_count * size_of::<ChunkStatusGpu>()) as u64;
+            self.cmd_alloc.Reset().unwrap();
+            self.cmd_list.Reset(&self.cmd_alloc, None).unwrap();
+            self.record_full_dispatch(&self.cmd_list, batch, &rchunks);
+            cmd_barriers(
+                &self.cmd_list,
+                vec![
+                    transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition_barrier(&self.rans.status_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                ],
+            );
+            self.cmd_list.CopyBufferRegion(&self.out_readback, 0, &self.out_blocks_default, 0, out_bytes);
+            self.cmd_list.CopyBufferRegion(&self.status_readback, 0, &self.rans.status_default, 0, status_bytes);
+            self.cmd_list.ResolveQueryData(&self.ts_query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &self.ts_readback, 0);
+            cmd_barriers(
+                &self.cmd_list,
+                vec![
+                    transition_barrier(&self.out_blocks_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    transition_barrier(&self.rans.status_default, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                ],
+            );
+            self.cmd_list.Close().unwrap();
+            let lists = [Some(self.cmd_list.cast::<ID3D12CommandList>().unwrap())];
+            ctx.compute_queue.ExecuteCommandLists(&lists);
+            ctx.signal_and_wait_compute();
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            self.out_readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: out_bytes as usize }), Some(&mut ptr)).unwrap();
+            let decoded = std::slice::from_raw_parts(ptr as *const u8, out_bytes as usize).to_vec();
+            self.out_readback.Unmap(0, None);
+
+            self.status_readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: status_bytes as usize }), Some(&mut ptr)).unwrap();
+            let statuses = std::slice::from_raw_parts(ptr as *const ChunkStatusGpu, batch.real_chunk_count).to_vec();
+            self.status_readback.Unmap(0, None);
+
+            (decoded, statuses, self.read_last_kernel_ms(ctx), total_ms)
+        }
     }
 }
 

@@ -1,14 +1,14 @@
 # bcpack-gpu-sdk — Hardware GPU BCPack Decoder, Gfx10 Detiler & Compute Kernel SDK
 
 [![DirectX 12](https://img.shields.io/badge/DirectX%2012-SM%206.6%20%2B%20Async%20Compute-2f80ed)](shaders/bcpack_decode.hlsl)
-[![Vulkan 1.3 SPIR-V](https://img.shields.io/badge/Vulkan%201.3-SPIR--V%20(12%20Kernels)-e74c3c)](shaders/spirv)
+[![Vulkan 1.3 SPIR-V](https://img.shields.io/badge/Vulkan%201.3-SPIR--V%20(14%20Kernels)-e74c3c)](shaders/spirv)
 [![C-ABI DLL](https://img.shields.io/badge/C--ABI-bcpack__gpu.dll%20%2B%20bcpack__gpu.h-blue)](include/bcpack_gpu.h)
 [![Verified 21/21 PASS](https://img.shields.io/badge/RTX%205080-21%2F21%20Bit--Exact%20PASS-brightgreen)](#verified-hardware-benchmarks-nvidia-rtx-5080)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-green)](LICENSE-MIT)
 
 **Standalone, bloat-free clean-room hardware GPU compute SDK (`MIT OR Apache-2.0`) for Xbox Series X|S translation layers, DirectStorage `IDStorageQueueX` hooks, Vulkan 1.3 Linux layers (`OpenScarlett` / Proton), and GPU backends for [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs).**
 
-No game assets, no demo media bloat, zero copyrighted data — only the production C-ABI DLL (`bcpack_gpu.dll`), Rust crate (`bcpack-gpu-sdk` `v0.12.0`), `include/bcpack_gpu.h`, **13 HLSL SM 6.6 + DXIL compute kernels**, and **12 precompiled Vulkan 1.3 SPIR-V (`.spv`) kernels** supporting **Full `BC1`, `BC3`, `BC4`, `BC5`, and Multi-Mode `BC7` (Modes 0–7)**.
+No game assets, no demo media bloat, zero copyrighted data — only the production C-ABI DLL (`bcpack_gpu.dll`), Rust crate (`bcpack-gpu-sdk` `v0.13.0`), `include/bcpack_gpu.h`, **15 HLSL SM 6.6 + DXIL compute kernels**, and **14 precompiled Vulkan 1.3 SPIR-V (`.spv`) kernels** supporting **all 6 BCPack formats: Full `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7)** with optional caller-supplied runtime table uploads.
 
 > Looking for the full 4K streaming benchmark, 12.41M Mesh-Shader showcase, MP4/GIF captures, and 19-test verification harness? See the companion showcase repository: **[`POMXARK/bcpack-gpu-hlsl`](https://github.com/POMXARK/bcpack-gpu-hlsl)** (which links this SDK via Git submodule at `sdk/`).
 > AI coding agents & crawlers: read **[`llms.txt`](llms.txt)** and **[`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md)**.
@@ -20,12 +20,14 @@ No game assets, no demo media bloat, zero copyrighted data — only the producti
 1. **Zero-Barrier Wave32 BCPack MDU rANS Decoders (`11.33 GB/s` BC1, `6.02 GB/s` BC7 rANS):**
    - Dual-chunk warp packing (`2 × 12` lanes for BC1 = `24/32` active; `2 × 16` lanes for BC7 = **`32/32` 100% Wave32 utilization**).
    - Register-resident `64B` stream sliding window with `WaveReadLaneAt` symbol transpose and 4-step branchless binary search — **zero `GroupMemoryBarrierWithGroupSync()` inside hot loops**.
-2. **Full Multi-Mode `BC7` (Modes 0–7) + `BC3` / `BC4` / `BC5` Block Rebuilders (`0` Byte Mismatches vs `bcpack-rs`):**
+2. **Full 6-Format Block Rebuilders (`BC1` / `BC3` / `BC4` / `BC5` / `BC6H` Modes 1–14 / `BC7` Modes 0–7):**
    - [`shaders/bcpack_bc7_rebuild.hlsl`](shaders/bcpack_bc7_rebuild.hlsl) (`Bc7FullGpuDecoder` / `BCPACK_FORMAT_BC7`): complete 128-bit BC7 block assembly across all 8 modes (`0..7`), partitions, Mode 4/5 channel rotations & index-selection, p-bits, anchor omissions, 255-entry dictionary, and 256-block history ring.
-   - [`shaders/bcpack_bcn_rans.hlsl`](shaders/bcpack_bcn_rans.hlsl) + [`shaders/bcpack_bcn_rebuild.hlsl`](shaders/bcpack_bcn_rebuild.hlsl) (`BcnGpuDecoder` / `BCPACK_FORMAT_BC3`, `BC4`, `BC5`): generalized 12-lane Wave32 rANS + pair/quad rank tables + dictionary/history rebuild.
+   - [`shaders/bcpack_bc6h_rans.hlsl`](shaders/bcpack_bc6h_rans.hlsl) + [`shaders/bcpack_bc6h_rebuild.hlsl`](shaders/bcpack_bc6h_rebuild.hlsl) (`Bc6hFullGpuDecoder` / `BCPACK_FORMAT_BC6H`): 16-lane Wave32 rANS + all 14 BC6H HDR modes (`1..14`), ascending high base bits (`13..14`), signed index deltas, 255-entry dictionary, and 256-block history ring.
+   - [`shaders/bcpack_bcn_rans.hlsl`](shaders/bcpack_bcn_rans.hlsl) + [`shaders/bcpack_bcn_rebuild.hlsl`](shaders/bcpack_bcn_rebuild.hlsl) (`BcnGpuDecoder` / `BCPACK_FORMAT_BC3`, `BC4`, `BC5`, and full-table `BC1`): generalized 12-lane Wave32 rANS + pair/quad rank tables + dictionary/history rebuild.
    - [`shaders/bc16_pack.hlsl`](shaders/bc16_pack.hlsl) + [`shaders/gfx10_detile.hlsl`](shaders/gfx10_detile.hlsl): inline RDNA2 bit-permutation detile (`SW_64KB_D` 8B/16B, `SW_4KB_S` 8B at **`432.6 GB/s`**) on `D3D12_COMMAND_LIST_TYPE_COMPUTE` before `CopyTextureRegion`.
-3. **Zero-Copy Shared-Device C-ABI (`bcpack_gpu.dll` + `include/bcpack_gpu.h`):**
-   - Attach directly to a caller's `ID3D12Device*` (`bcpack_gpu_create_from_device`) and decode + detile straight into `D3D12_HEAP_TYPE_DEFAULT` buffers (`BcPackDecodeToBuffer`) or `DXGI_FORMAT_BC{1,3,4,5,7}_UNORM` 2D subresources (`BcPackDecodeToTexture2D`, automatic `256B` row-pitch padding) synchronized via cross-queue `ID3D12Fence` (`0` CPU readback).
+3. **Zero-Copy Shared-Device C-ABI & Runtime Table Upload (`bcpack_gpu.dll` + `include/bcpack_gpu.h`):**
+   - Attach directly to a caller's `ID3D12Device*` (`bcpack_gpu_create_from_device`) and decode + detile straight into `D3D12_HEAP_TYPE_DEFAULT` buffers (`BcPackDecodeToBuffer`) or `DXGI_FORMAT_BC{1,3,4,5,6H_UF16,7}_UNORM` 2D subresources (`BcPackDecodeToTexture2D`, automatic `256B` row-pitch padding) synchronized via cross-queue `ID3D12Fence` (`0` CPU readback).
+   - Callers with external Xbox BCPack tables can upload them cleanly at runtime via `bcpack_gpu_set_bc1_tables`, `bcpack_gpu_set_bc6h_tables`, and `bcpack_gpu_set_bc7_tables` (`0` proprietary constants embedded).
 4. **SM 6.6 Virtual `ResourceDescriptorHeap[]` Pager (`1.25M → 262K` slots in `0.064 ms`):**
    - Solves NVIDIA DX12 `~1M` shader-visible descriptor heap `E_OUTOFMEMORY` crashes via `CopyDescriptorsSimple` LRU paging + `ResourceDescriptorHeap[NonUniformResourceIndex(g_VirtToPhys[id])]`.
 5. **Cross-Vendor Console Compute Helpers (DXIL + Vulkan 1.3 SPIR-V):**
@@ -99,8 +101,10 @@ git submodule add https://github.com/POMXARK/bcpack-gpu-sdk.git sdk
 | Kernel / Module | Targets | Wave / Threadgroup | Key Register Bindings | Role |
 |---|---|---|---|---|
 | `bcpack_decode.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `[WaveSize(32)]` `32` | `t0..t4`, `u0` (`uint2`), `u1` | Dual-chunk BC1 rANS + predictor + quad reconstruction |
-| `bcpack_bcn_rans.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `[WaveSize(32)]` `32` | `t0..t2`, `u0` (`uint` ×6/row), `u1` | Generalized 12-lane Wave32 rANS (`BC3` / `BC4` / `BC5`) |
-| `bcpack_bcn_rebuild.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `64` | `b0`, `t0..t4`, `u0`, `u1` | `BC3` / `BC4` / `BC5` pair/quad/dict/history block rebuilder |
+| `bcpack_bcn_rans.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `[WaveSize(32)]` `32` | `t0..t2`, `u0` (`uint` ×6/row), `u1` | Generalized 12-lane Wave32 rANS (`BC1` / `BC3` / `BC4` / `BC5`) |
+| `bcpack_bcn_rebuild.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `64` | `b0`, `t0..t4`, `u0`, `u1` | `BC1` / `BC3` / `BC4` / `BC5` pair/quad/dict/history block rebuilder |
+| `bcpack_bc6h_rans.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `[WaveSize(32)]` `32` | `t0..t2`, `u0` (`uint` ×8/row), `u1` | `32/32` 16-lane BC6H rANS entropy stage (`64B`/block syms) |
+| `bcpack_bc6h_rebuild.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `64` | `b0`, `t0..t2`, `u0` (`uint4`), `u1` | Full **BC6H (Modes 1–14)** dict/history block rebuilder |
 | `bcpack_bc7_rans.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `[WaveSize(32)]` `32` | `t0..t2`, `u0` (`uint` ×8/row), `u1` | `32/32` 16-lane BC7 rANS entropy stage (`64B`/block syms) |
 | `bcpack_bc7_rebuild.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `64` | `b0`, `t0..t3`, `u0` (`uint4`), `u1` | Full Multi-Mode **BC7 (Modes 0–7)** dict/history block rebuilder |
 | `bc16_pack.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `64` | `t0`, `u0` (`Store2`), `b0` | Collapses 16-lane symbol rows into `16B` BC7/BC5 blocks |
