@@ -1,0 +1,8 @@
+/target/
+Cargo.lock
+*.pdb
+*.exp
+*.ilk
+*.log
+.DS_Store
+Thumbs.db
