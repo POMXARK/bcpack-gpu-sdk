@@ -1416,34 +1416,50 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
             (BatchFamily::Bc7, bc7_indices),
             (BatchFamily::Bc6h, bc6h_indices),
         ];
+        let mut group_starts = [0usize; 4];
 
-        for (family, indices) in groups {
-            if indices.is_empty() {
-                continue;
+        // Pack all 4 format families into a SINGLE combined wave (zero inter-family CPU waits,
+        // one detile_cmd, one cross-queue Wait, and one tex_copy_cmd ExecuteCommandLists).
+        // Loops more than once only if total batch items exceed internal staging/decoder caps.
+        loop {
+            let any_remaining = groups
+                .iter()
+                .enumerate()
+                .any(|(gi, (_, idxs))| group_starts[gi] < idxs.len());
+            if !any_remaining {
+                break;
             }
-            let (unit_cap, out_cap) = match family {
-                BatchFamily::Bc1Fast => (state.max_blocks, (state.max_blocks * 8).min(state.max_output_bytes)),
-                BatchFamily::Bcn => (state.max_bcn_sym_rows, state.max_output_bytes),
-                BatchFamily::Bc7 => (state.max_bc7_blocks * 2, state.max_output_bytes),
-                BatchFamily::Bc6h => (state.max_bc6h_blocks * 2, state.max_output_bytes),
-            };
 
-            let mut start = 0usize;
-            while start < indices.len() {
-                // Drain prior sub-batch only when reusing internal scratch/command allocators.
-                if state.ctx.compute_fence_value > 0 {
-                    let _ = state.ctx.wait_compute_cpu(state.ctx.compute_fence_value, INFINITE);
+            // Drain prior wave only when reusing internal command allocators & staging buffers.
+            if state.ctx.compute_fence_value > 0 {
+                let _ = state.ctx.wait_compute_cpu(state.ctx.compute_fence_value, INFINITE);
+            }
+            if state.ctx.fence_value > 0 {
+                state.ctx.wait_direct_cpu(state.ctx.fence_value);
+            }
+
+            let mut wave_detile = 0usize;
+            let mut wave_pad = 0usize;
+            let mut wave_ranges: [(usize, usize); 4] = [(0, 0); 4];
+            let mut wave_total_items = 0usize;
+
+            for (gi, (family, indices)) in groups.iter().enumerate() {
+                let start = group_starts[gi];
+                if start >= indices.len() {
+                    wave_ranges[gi] = (start, start);
+                    continue;
                 }
-                if state.ctx.fence_value > 0 {
-                    state.ctx.wait_direct_cpu(state.ctx.fence_value);
-                }
+                let (unit_cap, out_cap) = match family {
+                    BatchFamily::Bc1Fast => (state.max_blocks, (state.max_blocks * 8).min(state.max_output_bytes)),
+                    BatchFamily::Bcn => (state.max_bcn_sym_rows, state.max_output_bytes),
+                    BatchFamily::Bc7 => (state.max_bc7_blocks * 2, state.max_output_bytes),
+                    BatchFamily::Bc6h => (state.max_bc6h_blocks * 2, state.max_output_bytes),
+                };
 
                 let mut end = start;
                 let mut sub_units = 0usize;
                 let mut sub_out = 0usize;
                 let mut sub_stream = 0usize;
-                let mut sub_detile = 0usize;
-                let mut sub_pad = 0usize;
 
                 while end < indices.len() && (end - start) < max_chunks {
                     let item = &slice[indices[end]];
@@ -1470,27 +1486,43 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
                         0
                     };
 
-                    if end > start
+                    if (end > start || wave_total_items > 0)
                         && (sub_units + item_units > unit_cap
                             || sub_out + item_out > out_cap
                             || sub_stream + item_stream + 256 > max_stream
-                            || sub_detile + item_detile > state.max_output_bytes
-                            || sub_pad + item_pad > state.max_row_pad_bytes)
+                            || wave_detile + item_detile > state.max_output_bytes
+                            || wave_pad + item_pad > state.max_row_pad_bytes)
                     {
                         break;
                     }
                     sub_units += item_units;
                     sub_out += item_out;
                     sub_stream += item_stream;
-                    sub_detile += item_detile;
-                    sub_pad += item_pad;
+                    wave_detile += item_detile;
+                    wave_pad += item_pad;
                     end += 1;
+                    wave_total_items += 1;
                 }
 
-                let sub = &indices[start..end];
+                wave_ranges[gi] = (start, end);
+                group_starts[gi] = end;
+            }
 
-                // 1) Compute decode whole sub-batch (single submission on compute_queue)
-                let (decoded_res, mut compute_val) = match family {
+            if wave_total_items == 0 {
+                break;
+            }
+
+            // 1) Dispatch ALL active family decoders back-to-back on compute_queue (disjoint buffers, 0 CPU waits)
+            let mut family_decoded: [Option<ID3D12Resource>; 4] = [None, None, None, None];
+            let mut compute_val = state.ctx.compute_fence_value;
+
+            for (gi, (family, indices)) in groups.iter().enumerate() {
+                let (start, end) = wave_ranges[gi];
+                if start >= end {
+                    continue;
+                }
+                let sub = &indices[start..end];
+                let (decoded_res, fv) = match family {
                     BatchFamily::Bc1Fast => {
                         let batch = pack_batch(sub.iter().map(|&i| {
                             let it = &slice[i];
@@ -1529,32 +1561,47 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
                         (state.bcn_dec.out_blocks_default.clone(), fv)
                     }
                 };
+                family_decoded[gi] = Some(decoded_res);
+                compute_val = fv;
+            }
 
-                // Compute per-item source offsets and optional detile / row-pad plans
-                struct CopyPlan {
-                    from_detile: bool,
-                    src_off: usize,
-                    pad_off: Option<usize>,
-                    raw_row: u32,
-                    aligned_pitch: u32,
-                    width_blocks: u32,
-                    height_blocks: u32,
-                    dxgi_fmt: DXGI_FORMAT,
-                    dst_tex: ID3D12Resource,
-                    subresource_index: u32,
-                    dst_x_blocks: u32,
-                    dst_y_blocks: u32,
+            // Build unified copy + detile + row-pad plan across all families in this wave
+            struct CopyPlan {
+                family_idx: usize,
+                item_idx: usize,
+                from_detile: bool,
+                dec_off: usize,
+                src_off: usize,
+                pad_off: Option<usize>,
+                blk_bytes: u32,
+                raw_row: u32,
+                aligned_pitch: u32,
+                width_blocks: u32,
+                height_blocks: u32,
+                num_blocks: u32,
+                swizzle_mode: u32,
+                dxgi_fmt: DXGI_FORMAT,
+                dst_tex: ID3D12Resource,
+                subresource_index: u32,
+                dst_x_blocks: u32,
+                dst_y_blocks: u32,
+            }
+
+            let mut plans: Vec<CopyPlan> = Vec::with_capacity(wave_total_items);
+            let mut det_cursor = 0usize;
+            let mut pad_cursor = 0usize;
+            let mut any_detile = false;
+            let mut any_pad = false;
+            let mut fam_has_detile = [false; 4];
+            let mut fam_has_linear = [false; 4];
+
+            for (gi, (_, indices)) in groups.iter().enumerate() {
+                let (start, end) = wave_ranges[gi];
+                if start >= end {
+                    continue;
                 }
-
-                let mut plans: Vec<CopyPlan> = Vec::with_capacity(sub.len());
                 let mut dec_cursor = 0usize;
-                let mut det_cursor = 0usize;
-                let mut pad_cursor = 0usize;
-                let mut any_detile = false;
-                let mut any_linear = false;
-                let mut any_pad = false;
-
-                for &idx in sub {
+                for &idx in &indices[start..end] {
                     let it = &slice[idx];
                     let (blk_bytes, dxgi_fmt) = format_layout(it.format).unwrap();
                     let dec_bytes = (it.num_blocks as usize) * blk_bytes;
@@ -1564,12 +1611,13 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
                     let need_detile = it.swizzle_mode != BCPACK_SWIZZLE_LINEAR;
                     let src_off = if need_detile {
                         any_detile = true;
+                        fam_has_detile[gi] = true;
                         let off = det_cursor;
                         let lin_bytes = (it.width_blocks as usize) * (it.height_blocks as usize) * blk_bytes;
                         det_cursor += align512(lin_bytes);
                         off
                     } else {
-                        any_linear = true;
+                        fam_has_linear[gi] = true;
                         dec_off
                     };
 
@@ -1588,13 +1636,19 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
                         (*ManuallyDrop::new(ID3D12Resource::from_raw(it.dst_texture2d))).clone();
 
                     plans.push(CopyPlan {
+                        family_idx: gi,
+                        item_idx: idx,
                         from_detile: need_detile,
+                        dec_off,
                         src_off,
                         pad_off,
+                        blk_bytes: blk_bytes as u32,
                         raw_row: raw_row as u32,
                         aligned_pitch: aligned_pitch as u32,
                         width_blocks: it.width_blocks,
                         height_blocks: it.height_blocks,
+                        num_blocks: it.num_blocks,
+                        swizzle_mode: it.swizzle_mode,
                         dxgi_fmt,
                         dst_tex,
                         subresource_index: it.subresource_index,
@@ -1602,226 +1656,250 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
                         dst_y_blocks: it.dst_y_blocks,
                     });
                 }
+            }
 
-                // 2) Single compute command list for all Gfx10 detiles in this sub-batch
-                if any_detile {
-                    state.detile_alloc.Reset().unwrap();
-                    state.detile_cmd.Reset(&state.detile_alloc, None).unwrap();
-                    cmd_barriers(
-                        &state.detile_cmd,
-                        vec![
-                            transition_barrier(&decoded_res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                            transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                        ],
-                    );
-                    let mut dec_off = 0usize;
-                    let mut det_idx = 0usize;
-                    for &idx in sub {
-                        let it = &slice[idx];
-                        let (blk_bytes, _) = format_layout(it.format).unwrap();
-                        let dec_bytes = (it.num_blocks as usize) * blk_bytes;
-                        let plan = &plans[det_idx];
-                        det_idx += 1;
-                        if plan.from_detile {
-                            let tile_mode = detile_mode_for(blk_bytes, it.swizzle_mode).unwrap();
-                            state.detile.record_detile(
-                                &state.detile_cmd,
-                                decoded_res.GetGPUVirtualAddress(),
-                                state.detile_out_default.GetGPUVirtualAddress(),
-                                it.width_blocks,
-                                it.height_blocks,
-                                tile_mode,
-                                blk_bytes as u32,
-                                dec_off as u32,
-                                plan.src_off as u32,
-                                it.num_blocks,
-                            );
+            // 2) Single compute command list for all Gfx10 detiles across all 4 families
+            if any_detile {
+                state.detile_alloc.Reset().unwrap();
+                state.detile_cmd.Reset(&state.detile_alloc, None).unwrap();
+                let mut det_pre: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(5);
+                for gi in 0..4 {
+                    if fam_has_detile[gi] {
+                        if let Some(ref res) = family_decoded[gi] {
+                            det_pre.push(transition_barrier(
+                                res,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ));
                         }
-                        dec_off += dec_bytes;
                     }
-                    cmd_barriers(
-                        &state.detile_cmd,
-                        vec![
-                            transition_barrier(&decoded_res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                            transition_barrier(&state.detile_out_default, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
-                        ],
-                    );
-                    state.detile_cmd.Close().unwrap();
-                    let lists = [Some(state.detile_cmd.cast::<ID3D12CommandList>().unwrap())];
-                    state.ctx.compute_queue.ExecuteCommandLists(&lists);
-                    compute_val = state.ctx.signal_compute();
+                }
+                det_pre.push(transition_barrier(
+                    &state.detile_out_default,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ));
+                cmd_barriers(&state.detile_cmd, det_pre);
+
+                for plan in &plans {
+                    if plan.from_detile {
+                        let decoded_res = family_decoded[plan.family_idx].as_ref().unwrap();
+                        let tile_mode = detile_mode_for(plan.blk_bytes as usize, plan.swizzle_mode).unwrap();
+                        state.detile.record_detile(
+                            &state.detile_cmd,
+                            decoded_res.GetGPUVirtualAddress(),
+                            state.detile_out_default.GetGPUVirtualAddress(),
+                            plan.width_blocks,
+                            plan.height_blocks,
+                            tile_mode,
+                            plan.blk_bytes,
+                            plan.dec_off as u32,
+                            plan.src_off as u32,
+                            plan.num_blocks,
+                        );
+                    }
                 }
 
-                // 3) Single GPU cross-queue Wait + single DIRECT command list for all CopyTextureRegions
-                state
-                    .ctx
-                    .queue
-                    .Wait(&state.ctx.compute_fence, compute_val)
-                    .expect("DIRECT queue Wait compute_fence");
+                let mut det_post: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(5);
+                for gi in 0..4 {
+                    if fam_has_detile[gi] {
+                        if let Some(ref res) = family_decoded[gi] {
+                            det_post.push(transition_barrier(
+                                res,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COMMON,
+                            ));
+                        }
+                    }
+                }
+                det_post.push(transition_barrier(
+                    &state.detile_out_default,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+                cmd_barriers(&state.detile_cmd, det_post);
 
-                state.tex_copy_alloc.Reset().unwrap();
-                state.tex_copy_cmd.Reset(&state.tex_copy_alloc, None).unwrap();
+                state.detile_cmd.Close().unwrap();
+                let lists = [Some(state.detile_cmd.cast::<ID3D12CommandList>().unwrap())];
+                state.ctx.compute_queue.ExecuteCommandLists(&lists);
+                compute_val = state.ctx.signal_compute();
+            }
 
-                let mut pre_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
-                if any_linear {
-                    pre_barriers.push(transition_barrier(
-                        &decoded_res,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ));
-                }
-                if any_detile {
-                    pre_barriers.push(transition_barrier(
-                        &state.detile_out_default,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ));
-                }
-                if any_pad {
-                    pre_barriers.push(transition_barrier(
-                        &state.row_pad_default,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                    ));
-                }
-                if !pre_barriers.is_empty() {
-                    cmd_barriers(&state.tex_copy_cmd, pre_barriers);
-                }
+            // 3) Single GPU cross-queue Wait + single DIRECT command list for ALL families
+            state
+                .ctx
+                .queue
+                .Wait(&state.ctx.compute_fence, compute_val)
+                .expect("DIRECT queue Wait compute_fence");
 
-                if any_pad {
-                    for p in &plans {
-                        if let Some(pad_off) = p.pad_off {
-                            let src_buf = if p.from_detile {
-                                &state.detile_out_default
-                            } else {
-                                &decoded_res
-                            };
-                            if p.aligned_pitch == p.raw_row {
+            state.tex_copy_alloc.Reset().unwrap();
+            state.tex_copy_cmd.Reset(&state.tex_copy_alloc, None).unwrap();
+
+            let mut pre_barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+            for gi in 0..4 {
+                if fam_has_linear[gi] {
+                    if let Some(ref res) = family_decoded[gi] {
+                        pre_barriers.push(transition_barrier(
+                            res,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ));
+                    }
+                }
+            }
+            if any_detile {
+                pre_barriers.push(transition_barrier(
+                    &state.detile_out_default,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ));
+            }
+            if any_pad {
+                pre_barriers.push(transition_barrier(
+                    &state.row_pad_default,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ));
+            }
+            if !pre_barriers.is_empty() {
+                cmd_barriers(&state.tex_copy_cmd, pre_barriers);
+            }
+
+            if any_pad {
+                for p in &plans {
+                    if let Some(pad_off) = p.pad_off {
+                        let src_buf = if p.from_detile {
+                            &state.detile_out_default
+                        } else {
+                            family_decoded[p.family_idx].as_ref().unwrap()
+                        };
+                        if p.aligned_pitch == p.raw_row {
+                            state.tex_copy_cmd.CopyBufferRegion(
+                                &state.row_pad_default,
+                                pad_off as u64,
+                                src_buf,
+                                p.src_off as u64,
+                                (p.raw_row as u64) * (p.height_blocks as u64),
+                            );
+                        } else {
+                            for r in 0..p.height_blocks {
                                 state.tex_copy_cmd.CopyBufferRegion(
                                     &state.row_pad_default,
-                                    pad_off as u64,
+                                    (pad_off as u64) + (r as u64) * (p.aligned_pitch as u64),
                                     src_buf,
-                                    p.src_off as u64,
-                                    (p.raw_row as u64) * (p.height_blocks as u64),
+                                    (p.src_off as u64) + (r as u64) * (p.raw_row as u64),
+                                    p.raw_row as u64,
                                 );
-                            } else {
-                                for r in 0..p.height_blocks {
-                                    state.tex_copy_cmd.CopyBufferRegion(
-                                        &state.row_pad_default,
-                                        (pad_off as u64) + (r as u64) * (p.aligned_pitch as u64),
-                                        src_buf,
-                                        (p.src_off as u64) + (r as u64) * (p.raw_row as u64),
-                                        p.raw_row as u64,
-                                    );
-                                }
                             }
                         }
                     }
-                    cmd_barriers(
-                        &state.tex_copy_cmd,
-                        vec![transition_barrier(
-                            &state.row_pad_default,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        )],
-                    );
                 }
+                cmd_barriers(
+                    &state.tex_copy_cmd,
+                    vec![transition_barrier(
+                        &state.row_pad_default,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )],
+                );
+            }
 
-                // Deduplicate destination ID3D12Resource transitions
-                let mut unique_dsts: Vec<ID3D12Resource> = Vec::new();
-                for p in &plans {
-                    let raw = p.dst_tex.as_raw() as usize;
-                    if !unique_dsts.iter().any(|d| d.as_raw() as usize == raw) {
-                        unique_dsts.push(p.dst_tex.clone());
-                    }
+            // Deduplicate destination ID3D12Resource transitions across all 4 families
+            let mut unique_dsts: Vec<ID3D12Resource> = Vec::new();
+            for p in &plans {
+                let raw = p.dst_tex.as_raw() as usize;
+                if !unique_dsts.iter().any(|d| d.as_raw() as usize == raw) {
+                    unique_dsts.push(p.dst_tex.clone());
                 }
-                let dst_to_copy: Vec<D3D12_RESOURCE_BARRIER> = unique_dsts
-                    .iter()
-                    .map(|d| transition_barrier(d, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST))
-                    .collect();
-                cmd_barriers(&state.tex_copy_cmd, dst_to_copy);
+            }
+            let dst_to_copy: Vec<D3D12_RESOURCE_BARRIER> = unique_dsts
+                .iter()
+                .map(|d| transition_barrier(d, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST))
+                .collect();
+            cmd_barriers(&state.tex_copy_cmd, dst_to_copy);
 
-                for p in &plans {
-                    let (copy_src, copy_off) = if let Some(pad_off) = p.pad_off {
-                        (&state.row_pad_default, pad_off as u64)
-                    } else if p.from_detile {
-                        (&state.detile_out_default, p.src_off as u64)
-                    } else {
-                        (&decoded_res, p.src_off as u64)
-                    };
-                    let mut dst_loc = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: ManuallyDrop::new(Some(p.dst_tex.clone())),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: p.subresource_index,
-                        },
-                    };
-                    let mut src_loc = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: ManuallyDrop::new(Some(copy_src.clone())),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: copy_off,
-                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                    Format: p.dxgi_fmt,
-                                    Width: p.width_blocks * 4,
-                                    Height: p.height_blocks * 4,
-                                    Depth: 1,
-                                    RowPitch: p.aligned_pitch,
-                                },
+            for p in &plans {
+                let (copy_src, copy_off) = if let Some(pad_off) = p.pad_off {
+                    (&state.row_pad_default, pad_off as u64)
+                } else if p.from_detile {
+                    (&state.detile_out_default, p.src_off as u64)
+                } else {
+                    (family_decoded[p.family_idx].as_ref().unwrap(), p.src_off as u64)
+                };
+                let mut dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(p.dst_tex.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: p.subresource_index,
+                    },
+                };
+                let mut src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(copy_src.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: copy_off,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: p.dxgi_fmt,
+                                Width: p.width_blocks * 4,
+                                Height: p.height_blocks * 4,
+                                Depth: 1,
+                                RowPitch: p.aligned_pitch,
                             },
                         },
-                    };
-                    state.tex_copy_cmd.CopyTextureRegion(
-                        &dst_loc,
-                        p.dst_x_blocks * 4,
-                        p.dst_y_blocks * 4,
-                        0,
-                        &src_loc,
-                        None,
-                    );
-                    let _ = ManuallyDrop::take(&mut dst_loc.pResource);
-                    let _ = ManuallyDrop::take(&mut src_loc.pResource);
-                }
+                    },
+                };
+                state.tex_copy_cmd.CopyTextureRegion(
+                    &dst_loc,
+                    p.dst_x_blocks * 4,
+                    p.dst_y_blocks * 4,
+                    0,
+                    &src_loc,
+                    None,
+                );
+                let _ = ManuallyDrop::take(&mut dst_loc.pResource);
+                let _ = ManuallyDrop::take(&mut src_loc.pResource);
+            }
 
-                let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = unique_dsts
-                    .iter()
-                    .map(|d| transition_barrier(d, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON))
-                    .collect();
-                if any_linear {
-                    post_barriers.push(transition_barrier(
-                        &decoded_res,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COMMON,
-                    ));
+            let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = unique_dsts
+                .iter()
+                .map(|d| transition_barrier(d, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON))
+                .collect();
+            for gi in 0..4 {
+                if fam_has_linear[gi] {
+                    if let Some(ref res) = family_decoded[gi] {
+                        post_barriers.push(transition_barrier(
+                            res,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        ));
+                    }
                 }
-                if any_detile {
-                    post_barriers.push(transition_barrier(
-                        &state.detile_out_default,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COMMON,
-                    ));
-                }
-                if any_pad {
-                    post_barriers.push(transition_barrier(
-                        &state.row_pad_default,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_COMMON,
-                    ));
-                }
-                cmd_barriers(&state.tex_copy_cmd, post_barriers);
+            }
+            if any_detile {
+                post_barriers.push(transition_barrier(
+                    &state.detile_out_default,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+            }
+            if any_pad {
+                post_barriers.push(transition_barrier(
+                    &state.row_pad_default,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+            }
+            cmd_barriers(&state.tex_copy_cmd, post_barriers);
 
-                state.tex_copy_cmd.Close().unwrap();
-                let lists = [Some(state.tex_copy_cmd.cast::<ID3D12CommandList>().unwrap())];
-                state.ctx.queue.ExecuteCommandLists(&lists);
-                last_direct_fence = state.ctx.signal_direct_async();
+            state.tex_copy_cmd.Close().unwrap();
+            let lists = [Some(state.tex_copy_cmd.cast::<ID3D12CommandList>().unwrap())];
+            state.ctx.queue.ExecuteCommandLists(&lists);
+            last_direct_fence = state.ctx.signal_direct_async();
 
-                for &idx in sub {
-                    slice[idx].status = 0;
-                    succeeded += 1;
-                }
-
-                start = end;
+            for p in &plans {
+                slice[p.item_idx].status = 0;
+                succeeded += 1;
             }
         }
 
