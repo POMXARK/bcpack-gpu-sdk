@@ -1317,3 +1317,167 @@ fn bcpack_decode_batch_to_textures_all_6_formats_and_detile() {
         bcpack_gpu_destroy(ctx);
     }
 }
+
+#[test]
+fn bc1_lane1_index_reference_matches_bcpack_rs_issue10() {
+    use bcpack::bc1;
+
+    unsafe {
+        let ctx = bcpack_gpu_create(8, 1024, 65_536);
+        assert!(!ctx.is_null());
+
+        let make_stream = |reference: u16| -> Vec<u8> {
+            let lanes: Vec<_> = (0..12)
+                .map(|i| {
+                    vec![Fragment {
+                        symbols: vec![
+                            if i >= 2 { 2 + (i as u16 % 4) } else { 0 },
+                            if i == 1 { reference } else { 0 },
+                        ],
+                        q: 7,
+                        z: 0,
+                    }]
+                })
+                .collect();
+            encode_lanes(&bc1::BC1_ALPHABET_BITS, &lanes).expect("encode_lanes failed")
+        };
+
+        let first = [0xa1u8, 0x17, 0x5d, 0xf0, 0x50, 0x50, 0xfa, 0xaf];
+        let expected_ref0 = [0x00u8, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xaa];
+        let expected_ref1 = [0xa1u8, 0x17, 0x5d, 0xf0, 0x0a, 0x0a, 0x5f, 0xf5];
+
+        let s0 = make_stream(0);
+        let s1 = make_stream(1);
+
+        let mut async0 = vec![0u8; 16];
+        let mut async1 = vec![0u8; 16];
+        let mut f0 = 0u64;
+        let mut f1 = 0u64;
+        assert_eq!(
+            BcPackDecodeAsync(
+                ctx,
+                s0.as_ptr(),
+                s0.len() as u32,
+                2,
+                BCPACK_FORMAT_BC1,
+                BCPACK_SWIZZLE_LINEAR,
+                0,
+                0,
+                async0.as_mut_ptr(),
+                16,
+                &mut f0,
+            ),
+            0
+        );
+        assert_eq!(
+            BcPackDecodeAsync(
+                ctx,
+                s1.as_ptr(),
+                s1.len() as u32,
+                2,
+                BCPACK_FORMAT_BC1,
+                BCPACK_SWIZZLE_LINEAR,
+                0,
+                0,
+                async1.as_mut_ptr(),
+                16,
+                &mut f1,
+            ),
+            0
+        );
+        assert_eq!(&async0[..8], &first);
+        assert_eq!(&async0[8..], &expected_ref0);
+        assert_eq!(&async1[..8], &first);
+        assert_eq!(&async1[8..], &expected_ref1);
+
+        let mut batch0 = vec![0u8; 16];
+        let mut batch1 = vec![0u8; 16];
+        let mut items = [
+            BcPackBatchItem {
+                compressed_data: s0.as_ptr(),
+                compressed_size: s0.len() as u32,
+                num_blocks: 2,
+                format: BCPACK_FORMAT_BC1,
+                swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+                width_blocks: 0,
+                height_blocks: 0,
+                out_host_buffer: batch0.as_mut_ptr(),
+                out_capacity: 16,
+                status: -1,
+            },
+            BcPackBatchItem {
+                compressed_data: s1.as_ptr(),
+                compressed_size: s1.len() as u32,
+                num_blocks: 2,
+                format: BCPACK_FORMAT_BC1,
+                swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+                width_blocks: 0,
+                height_blocks: 0,
+                out_host_buffer: batch1.as_mut_ptr(),
+                out_capacity: 16,
+                status: -1,
+            },
+        ];
+        let mut kms = 0.0f64;
+        assert_eq!(BcPackDecodeBatch(ctx, items.as_mut_ptr(), 2, &mut kms), 2);
+        assert_eq!(items[0].status, 0);
+        assert_eq!(items[1].status, 0);
+        assert_eq!(&batch0[..8], &first);
+        assert_eq!(&batch0[8..], &expected_ref0);
+        assert_eq!(&batch1[..8], &first);
+        assert_eq!(&batch1[8..], &expected_ref1);
+        println!("[v15.1] bc1_lane1_index_reference (bcpack-rs#10): Async + Batch exact match");
+
+        bcpack_gpu_destroy(ctx);
+    }
+}
+
+#[test]
+fn batch_apis_reset_item_status_before_early_error() {
+    unsafe {
+        let mut batch_item = BcPackBatchItem {
+            compressed_data: std::ptr::null(),
+            compressed_size: 0,
+            num_blocks: 0,
+            format: BCPACK_FORMAT_BC1,
+            swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+            width_blocks: 0,
+            height_blocks: 0,
+            out_host_buffer: std::ptr::null_mut(),
+            out_capacity: 0,
+            status: 0,
+        };
+        let rc_batch = BcPackDecodeBatch(
+            std::ptr::null_mut(),
+            &mut batch_item,
+            1,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc_batch, -1);
+        assert_eq!(batch_item.status, -1);
+
+        let mut tex_item = BcPackTextureBatchItem {
+            compressed_data: std::ptr::null(),
+            compressed_size: 0,
+            num_blocks: 0,
+            format: BCPACK_FORMAT_BC1,
+            swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+            width_blocks: 0,
+            height_blocks: 0,
+            dst_texture2d: std::ptr::null_mut(),
+            subresource_index: 0,
+            dst_x_blocks: 0,
+            dst_y_blocks: 0,
+            status: 0,
+        };
+        let rc_tex = BcPackDecodeBatchToTextures(
+            std::ptr::null_mut(),
+            &mut tex_item,
+            1,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc_tex, -1);
+        assert_eq!(tex_item.status, -1);
+        println!("[v15.1] batch_apis_reset_item_status_before_early_error: status reset to -1 before null-ctx error");
+    }
+}

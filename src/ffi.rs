@@ -953,6 +953,11 @@ pub unsafe extern "C" fn BcPackDecodeBatch(
     count: u32,
     out_total_kernel_ms: *mut f64,
 ) -> i32 {
+    if count > 0 && !items.is_null() {
+        for item in std::slice::from_raw_parts_mut(items, count as usize).iter_mut() {
+            item.status = -1;
+        }
+    }
     if ctx.is_null() {
         return -1;
     }
@@ -1235,6 +1240,11 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
     count: u32,
     out_direct_fence_value: *mut u64,
 ) -> i32 {
+    if count > 0 && !items.is_null() {
+        for item in std::slice::from_raw_parts_mut(items, count as usize).iter_mut() {
+            item.status = -1;
+        }
+    }
     if ctx.is_null() {
         return -1;
     }
