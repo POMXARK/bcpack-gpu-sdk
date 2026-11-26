@@ -39,6 +39,7 @@ static const uint RANS_L = 0x01000000u;
 static const uint BC1_ALPHABET_BITS[12] = { 7u, 7u, 4u, 5u, 4u, 4u, 5u, 4u, 7u, 7u, 7u, 7u };
 
 groupshared uint ring_ep[2][256];
+groupshared uint ring_line[2][256];
 groupshared uint lane_bf[10][24];
 groupshared uint lane_rfrsn[10][24];
 
@@ -111,6 +112,22 @@ int unzigzag(uint v) {
     return ((iv & 1) != 0) ? -((iv + 1) >> 1) : (iv >> 1);
 }
 
+uint codes_to_lines(uint w) {
+    uint lo = w & 0x55555555u;
+    uint hi = (w >> 1u) & 0x55555555u;
+    return (lo << 1u) | (lo ^ hi);
+}
+
+uint lines_to_codes(uint l) {
+    uint lo = l & 0x55555555u;
+    uint hi = (l >> 1u) & 0x55555555u;
+    return ((lo ^ hi) << 1u) | hi;
+}
+
+uint add_lines(uint a, uint b) {
+    return (a ^ b) ^ (((a & b) & 0x55555555u) << 1u);
+}
+
 [WaveSize(32)]
 [numthreads(32, 1, 1)]
 void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
@@ -126,6 +143,8 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
         uint w = g_Window[i];
         ring_ep[0][i] = w;
         ring_ep[1][i] = w;
+        ring_line[0][i] = 0u;
+        ring_line[1][i] = 0u;
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -336,6 +355,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
         // ---------------- Lockstep symbol vector -> BC1 block via WaveReadLaneAt (0 barriers!) ----------------
         if (WaveActiveAnyTrue(half_emit)) {
             uint s0  = WaveReadLaneAt(slot_sym, half_shift + 0u);
+            uint s1  = WaveReadLaneAt(slot_sym, half_shift + 1u);
             uint s2  = WaveReadLaneAt(slot_sym, half_shift + 2u);
             uint s3  = WaveReadLaneAt(slot_sym, half_shift + 3u);
             uint s4  = WaveReadLaneAt(slot_sym, half_shift + 4u);
@@ -348,7 +368,8 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
             uint s11 = WaveReadLaneAt(slot_sym, half_shift + 11u);
 
             if (half_emit && ll == 0u && block_idx < desc.blocks) {
-                uint d = back_distance(s0);
+                uint x = s1 & 255u;
+                uint d = uint(int(x) + unzigzag(s0)) & 255u;
                 uint pred = 0u;
                 if (d > 0u) {
                     uint slot = uint((int(block_idx) - int(d)) & 255);
@@ -374,10 +395,16 @@ void CSMain(uint3 groupID : SV_GroupID, uint lane : SV_GroupIndex) {
                 uint ep = c0 | (c1 << 16u);
                 ring_ep[sub][block_idx & 255u] = ep;
 
-                uint idx_word = g_QuadMasks[s8 & 255u]
+                uint residual = g_QuadMasks[s8 & 255u]
                               | g_QuadMasks[256u + (s9 & 255u)]
                               | g_QuadMasks[512u + (s10 & 255u)]
                               | g_QuadMasks[768u + (s11 & 255u)];
+                uint ref_line = (x > 0u && x <= block_idx)
+                    ? ring_line[sub][(block_idx - x) & 255u]
+                    : 0u;
+                uint line_pos = add_lines(codes_to_lines(residual), ref_line);
+                ring_line[sub][block_idx & 255u] = line_pos;
+                uint idx_word = lines_to_codes(line_pos);
 
                 g_OutBlocks[desc.out_block_offset + block_idx] = uint2(ep, idx_word);
             }

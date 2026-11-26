@@ -3007,7 +3007,7 @@ impl Bc7FullGpuDecoder {
             for (i, &c) in ctls.iter().enumerate() {
                 if c != 0 {
                     let mode = u32::from(c & 7);
-                    let rot = u32::from((c >> 3) & 3);
+                    let rot = if mode == 4 || mode == 5 { u32::from((c >> 3) & 3) } else { 0 };
                     let sel = u32::from((c >> 5) & 1);
                     let part = u32::from((c >> 8) & 63);
                     packed[i] = 0x8000_0000u32 | mode | (part << 8) | (rot << 16) | (sel << 24);

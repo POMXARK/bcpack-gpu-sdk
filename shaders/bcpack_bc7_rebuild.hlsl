@@ -202,7 +202,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
 
         uint mode      = ctl & 7u;
         uint partition = (ctl >> 8u) & 63u;
-        uint rotation  = (ctl >> 16u) & 3u;
+        uint rotation  = (mode == 4u || mode == 5u) ? ((ctl >> 16u) & 3u) : 0u;
         uint idx_sel   = (ctl >> 24u) & 1u;
 
         uint subsets = SUBSETS[mode];

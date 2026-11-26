@@ -878,3 +878,144 @@ fn bench_cpu_vs_gpu_batch_and_zerocopy() {
         bcpack_gpu_destroy(ctx);
     }
 }
+
+#[test]
+fn bc1_lane1_index_reference_bit_exact() {
+    unsafe {
+        let ctx = bcpack_gpu_create(16, 4096, 1024 * 1024);
+        assert!(!ctx.is_null());
+
+        let ab = BcpMode::Bc1.alphabet_bits();
+        let blocks = 512usize;
+        let mut rng = Rng(0xBC1_1A4E_1u64);
+        let mut lanes: Vec<Vec<Fragment>> = Vec::with_capacity(ab.len());
+        for (lane_idx, &bits) in ab.iter().enumerate() {
+            let lim = 1u64 << bits;
+            let mut syms = Vec::with_capacity(blocks);
+            for i in 0..blocks {
+                let s = if lane_idx == 1 {
+                    // Mix pre-start reference on early blocks and non-zero distances 1..=31
+                    if i == 0 {
+                        3u16
+                    } else {
+                        ((rng.next_u64() % 31) + 1) as u16
+                    }
+                } else {
+                    rng.below(lim) as u16
+                };
+                syms.push(s);
+            }
+            lanes.push(vec![Fragment {
+                symbols: syms,
+                q: 0,
+                z: 0,
+            }]);
+        }
+        let stream = encode_lanes(ab, &lanes).expect("encode BC1 lane 1 stream");
+        let cpu_out = cpu_decode_reference(BcpMode::Bc1, &stream, blocks);
+
+        // 1. Check BcPackDecodeAsync (fast Wave32 BC1 path)
+        let mut gpu_async = vec![0u8; blocks * 8];
+        let mut fv = 0u64;
+        let rc = BcPackDecodeAsync(
+            ctx,
+            stream.as_ptr(),
+            stream.len() as u32,
+            blocks as u32,
+            BCPACK_FORMAT_BC1,
+            BCPACK_SWIZZLE_LINEAR,
+            0,
+            0,
+            gpu_async.as_mut_ptr(),
+            gpu_async.len() as u32,
+            &mut fv,
+        );
+        assert_eq!(rc, 0, "BcPackDecodeAsync failed: {rc}");
+        assert_eq!(gpu_async, cpu_out, "BC1 lane 1 async mismatch vs bcpack-rs!");
+
+        // 2. Check BcPackDecodeBatch
+        let mut gpu_batch = vec![0u8; blocks * 8];
+        let mut item = BcPackBatchItem {
+            compressed_data: stream.as_ptr(),
+            compressed_size: stream.len() as u32,
+            num_blocks: blocks as u32,
+            format: BCPACK_FORMAT_BC1,
+            swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+            width_blocks: 0,
+            height_blocks: 0,
+            out_host_buffer: gpu_batch.as_mut_ptr(),
+            out_capacity: gpu_batch.len() as u32,
+            status: 99,
+        };
+        let mut kms = 0.0f64;
+        let ok = BcPackDecodeBatch(ctx, &mut item, 1, &mut kms);
+        assert_eq!(ok, 1);
+        assert_eq!(item.status, 0);
+        assert_eq!(gpu_batch, cpu_out, "BC1 lane 1 batch mismatch vs bcpack-rs!");
+
+        println!(
+            "[v14.1-bc1-lane1] {blocks} blocks with non-zero lane 1 index refs: 0 byte mismatches vs bcpack-rs (kernel={kms:.3} ms)"
+        );
+        bcpack_gpu_destroy(ctx);
+    }
+}
+
+#[test]
+fn bc7_rotation_ignored_outside_modes_4_5() {
+    unsafe {
+        let ctx = bcpack_gpu_create(16, 4096, 1024 * 1024);
+        assert!(!ctx.is_null());
+
+        let ctrl7 = valid_bc7_ctrl_codes();
+        let blocks = 64usize;
+        let stream = encode_synthetic_chunk(BcpMode::Bc7, blocks, 0xBC7_407A, &ctrl7);
+
+        // Compare Mode 0 table with rot=0 vs bogus non-zero rot=1 (must decode identically)
+        let ctrl_base = [((3u16) << 6) | 0u16; 512];
+        let ctrl_bogus_rot = [((3u16) << 6) | (1u16 << 3) | 0u16; 512];
+
+        let mut decode_with_ctrl = |tbl: &[u16; 512]| -> Vec<u8> {
+            assert_eq!(
+                bcpack_gpu_set_bc7_tables(
+                    ctx,
+                    tbl.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null()
+                ),
+                0
+            );
+            let mut out = vec![0u8; blocks * 16];
+            let mut item = BcPackBatchItem {
+                compressed_data: stream.as_ptr(),
+                compressed_size: stream.len() as u32,
+                num_blocks: blocks as u32,
+                format: BCPACK_FORMAT_BC7,
+                swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+                width_blocks: 0,
+                height_blocks: 0,
+                out_host_buffer: out.as_mut_ptr(),
+                out_capacity: out.len() as u32,
+                status: 99,
+            };
+            let mut kms = 0.0f64;
+            assert_eq!(BcPackDecodeBatch(ctx, &mut item, 1, &mut kms), 1);
+            assert_eq!(item.status, 0);
+            out
+        };
+
+        let out_base = decode_with_ctrl(&ctrl_base);
+        let out_bogus = decode_with_ctrl(&ctrl_bogus_rot);
+        assert!(out_base.iter().any(|&b| b != 0), "Expected non-trivial BC7 output");
+        assert_eq!(
+            out_base, out_bogus,
+            "Mode 0 should ignore ctrl rotation bits!"
+        );
+
+        println!(
+            "[v14.1-bc7-rot] Mode 0 with rot=0 vs rot=1 ({} bytes): 0 byte mismatches",
+            out_base.len()
+        );
+        bcpack_gpu_destroy(ctx);
+    }
+}

@@ -1,6 +1,6 @@
-# bcpack-gpu-sdk — AI Agent & Ecosystem Discovery Index (v0.14.0)
+# bcpack-gpu-sdk — AI Agent & Ecosystem Discovery Index (v0.14.1)
 
-> Standalone clean-room GPU Compute SDK (`MIT OR Apache-2.0`) extracted from `POMXARK/bcpack-gpu-hlsl` for Xbox Series translation layers, DirectStorage hooks, Vulkan 1.3 layers, and `bcpack-rs` consumers. Supports full bit-exact `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7) with mixed-format GPU batching (`BcPackDecodeBatch`), 6-format Texture2D zero-copy decode, and optional runtime table injection.
+> Standalone clean-room GPU Compute SDK (`MIT OR Apache-2.0`) extracted from `POMXARK/bcpack-gpu-hlsl` for Xbox Series translation layers, DirectStorage hooks, Vulkan 1.3 layers, and `bcpack-rs` consumers. Supports full bit-exact `BC1` (incl. `lane 1` index reference), `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7, rotation guarded to modes 4–5) with mixed-format GPU batching (`BcPackDecodeBatch`), 6-format Texture2D zero-copy decode, and optional runtime table injection.
 
 ## Exact Problems Solved & Search Keywords
 - `BCPack` / `IDStorageQueueX` / `dstorage` CPU decompression bottleneck (~40 MB/s CPU -> `11,327.6 MB/s` GPU BC1 / `6,024.0 MB/s` GPU BC7 rANS; `BcPackDecodeBatch` `41.7x` faster than single-chunk C-ABI loop)
@@ -29,4 +29,4 @@
 - `bindless_paging` (`1.25M -> 262K` physical slots): `0.064 ms` (`65,536` pixel samples, `0` mismatches)
 - `crowd_skin` (`500` NPCs, `512k` verts, `32k` bones): `0.075 ms` (`max_err=7.63e-6`)
 - `aaa_rtgi_cs` + `aaa_vrs` (`1080p` Ultra): `196.77 FPS` (CS RTGI) -> `258.91 FPS` (+VRS Tier 2)
-- `BcPackDecodeBatch` (`v0.14.0`, `384` mixed `64 KiB` chunks = `24.0 MiB` `BC1/3/4/5/6H/7`): `150.73 ms` wall (`0.17 GB/s`) / `116.07 ms` GPU kernel (`0.22 GB/s`), `41.7x` vs `BcPackDecodeAsync` loop (`6,289.43 ms`), `4.8x` vs 1T Ryzen 7 5700X `bcpack-rs` (`725.26 ms` 1T / `118.78 ms` 16T on `20.0 MiB` `BC1/3/4/5/7`)
+- `BcPackDecodeBatch` (`v0.14.1`, `384` mixed `64 KiB` chunks = `24.0 MiB` `BC1/3/4/5/6H/7`): `156.29 ms` wall (`0.16 GB/s`) / `118.13 ms` GPU kernel (`0.21 GB/s`), `42.7x` vs `BcPackDecodeAsync` loop (`6,681.02 ms`), `2.3x` vs 1T Ryzen 7 5700X `bcpack-rs` `7b2b421` (`365.87 ms` 1T / `62.61 ms` 16T on `20.0 MiB` `BC1/3/4/5/7`)
