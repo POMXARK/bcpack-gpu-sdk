@@ -4,7 +4,9 @@ use bcpack::bcn as bcp_bcn;
 use bcpack::encode::{encode_lanes, Fragment, Rng};
 use bcpack::format::Mode as BcpMode;
 use bcpack_gpu::ffi::*;
-use bcpack_gpu::gpu_decoder::{create_committed_buffer, GpuContext};
+use bcpack_gpu::gpu_decoder::{
+    cmd_barriers, create_committed_buffer, heap_props, transition_barrier, GpuContext,
+};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::time::Instant;
@@ -1016,6 +1018,302 @@ fn bc7_rotation_ignored_outside_modes_4_5() {
             "[v14.1-bc7-rot] Mode 0 with rot=0 vs rot=1 ({} bytes): 0 byte mismatches",
             out_base.len()
         );
+        bcpack_gpu_destroy(ctx);
+    }
+}
+
+#[test]
+fn bcpack_decode_batch_to_textures_all_6_formats_and_detile() {
+    unsafe {
+        let ctrl7 = valid_bc7_ctrl_codes();
+        let mut gpu = GpuContext::new(false);
+        let ctx = bcpack_gpu_create_from_device(
+            gpu.device.as_raw(),
+            gpu.compute_queue.as_raw(),
+            0,
+            0,
+            0,
+        );
+        assert!(!ctx.is_null());
+
+        struct TexJob {
+            mode: BcpMode,
+            fmt: u32,
+            dxgi: DXGI_FORMAT,
+            blk_bytes: usize,
+            wb: u32,
+            hb: u32,
+            swizzle: u32,
+            stream: Vec<u8>,
+            expected: Vec<u8>,
+            tex: ID3D12Resource,
+            subresource: u32,
+            mip_levels: u16,
+        }
+
+        // Mix all 6 formats, small sub-256B RowPitch (16x16 = 64x64px), Gfx10 SW_64KB_D detile,
+        // and multi-mip destination texture sharing.
+        let mut jobs: Vec<TexJob> = Vec::new();
+        let specs: &[(BcpMode, u32, u32, u32)] = &[
+            (BcpMode::Bc1, 128, 128, BCPACK_SWIZZLE_LINEAR),      // 512x512 linear
+            (BcpMode::Bc1, 128, 128, BCPACK_SWIZZLE_GFX10_64KB_D),// 512x512 Gfx10 64KB_D detile
+            (BcpMode::Bc1, 16, 16, BCPACK_SWIZZLE_LINEAR),        // 64x64 auto 256B RowPitch pad
+            (BcpMode::Bc3, 64, 64, BCPACK_SWIZZLE_LINEAR),        // 256x256
+            (BcpMode::Bc4, 64, 64, BCPACK_SWIZZLE_LINEAR),        // 256x256
+            (BcpMode::Bc5, 64, 64, BCPACK_SWIZZLE_LINEAR),        // 256x256
+            (BcpMode::Bc7, 64, 64, BCPACK_SWIZZLE_GFX10_64KB_D),  // 256x256 Gfx10 detile + RowPitch
+            (BcpMode::Bc6h, 64, 64, BCPACK_SWIZZLE_LINEAR),       // 256x256
+        ];
+
+        for (i, &(mode, wb, hb, swizzle)) in specs.iter().enumerate() {
+            let (fmt, dxgi, blk_bytes, _) = format_info(mode);
+            let blocks = (wb * hb) as usize;
+            let raw_lin = encode_synthetic_chunk(mode, blocks, 0xD150_0000 + (i as u64) * 97, &ctrl7);
+            let expected = if swizzle != BCPACK_SWIZZLE_LINEAR {
+                let ref_tex = create_bc_texture2d(&gpu.device, dxgi, wb, hb);
+                let mut rf = 0u64;
+                assert_eq!(
+                    BcPackDecodeToTexture2D(
+                        ctx,
+                        raw_lin.as_ptr(),
+                        raw_lin.len() as u32,
+                        blocks as u32,
+                        fmt,
+                        swizzle,
+                        wb,
+                        hb,
+                        ref_tex.as_raw(),
+                        0,
+                        0,
+                        0,
+                        &mut rf,
+                    ),
+                    0
+                );
+                assert_eq!(BcPackWaitDirectFence(ctx, rf, u32::MAX), 0);
+                readback_bc_texture2d(&mut gpu, &ref_tex, dxgi, wb, hb, blk_bytes)
+            } else if mode == BcpMode::Bc6h {
+                let mut buf = vec![0u8; blocks * blk_bytes];
+                let mut fv = 0u64;
+                assert_eq!(
+                    BcPackDecodeAsync(
+                        ctx,
+                        raw_lin.as_ptr(),
+                        raw_lin.len() as u32,
+                        blocks as u32,
+                        fmt,
+                        BCPACK_SWIZZLE_LINEAR,
+                        0,
+                        0,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        &mut fv,
+                    ),
+                    0
+                );
+                buf
+            } else {
+                cpu_decode_reference(mode, &raw_lin, blocks)
+            };
+            let stream = raw_lin;
+            let tex = create_bc_texture2d(&gpu.device, dxgi, wb, hb);
+            jobs.push(TexJob {
+                mode,
+                fmt,
+                dxgi,
+                blk_bytes,
+                wb,
+                hb,
+                swizzle,
+                stream,
+                expected,
+                tex,
+                subresource: 0,
+                mip_levels: 1,
+            });
+        }
+
+        // Duplicate destination texture test (mip 0 + mip 1 on one BC7 resource)
+        let mip_tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 2,
+            Format: DXGI_FORMAT_BC7_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        let mut mip_tex_opt: Option<ID3D12Resource> = None;
+        gpu.device
+            .CreateCommittedResource(
+                &heap_props(D3D12_HEAP_TYPE_DEFAULT),
+                D3D12_HEAP_FLAG_NONE,
+                &mip_tex_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut mip_tex_opt,
+            )
+            .unwrap();
+        let mip_tex = mip_tex_opt.unwrap();
+        for (mip_idx, wb, hb) in [(0u32, 64u32, 64u32), (1u32, 32u32, 32u32)] {
+            let blocks = (wb * hb) as usize;
+            let st = encode_synthetic_chunk(BcpMode::Bc7, blocks, 0xD150_9000 + mip_idx as u64, &ctrl7);
+            let exp = cpu_decode_reference(BcpMode::Bc7, &st, blocks);
+            jobs.push(TexJob {
+                mode: BcpMode::Bc7,
+                fmt: BCPACK_FORMAT_BC7,
+                dxgi: DXGI_FORMAT_BC7_UNORM,
+                blk_bytes: 16,
+                wb,
+                hb,
+                swizzle: BCPACK_SWIZZLE_LINEAR,
+                stream: st,
+                expected: exp,
+                tex: mip_tex.clone(),
+                subresource: mip_idx,
+                mip_levels: 2,
+            });
+        }
+
+        let mut items: Vec<BcPackTextureBatchItem> = jobs
+            .iter()
+            .map(|j| BcPackTextureBatchItem {
+                compressed_data: j.stream.as_ptr(),
+                compressed_size: j.stream.len() as u32,
+                num_blocks: j.wb * j.hb,
+                format: j.fmt,
+                swizzle_mode: j.swizzle,
+                width_blocks: j.wb,
+                height_blocks: j.hb,
+                dst_texture2d: j.tex.as_raw(),
+                subresource_index: j.subresource,
+                dst_x_blocks: 0,
+                dst_y_blocks: 0,
+                status: 99,
+            })
+            .collect();
+
+        // Append 1 invalid item to verify per-item isolation
+        items.push(BcPackTextureBatchItem {
+            compressed_data: std::ptr::null(),
+            compressed_size: 0,
+            num_blocks: 0,
+            format: BCPACK_FORMAT_BC1,
+            swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+            width_blocks: 0,
+            height_blocks: 0,
+            dst_texture2d: std::ptr::null_mut(),
+            subresource_index: 0,
+            dst_x_blocks: 0,
+            dst_y_blocks: 0,
+            status: 99,
+        });
+
+        let mut fence = 0u64;
+        let queued = BcPackDecodeBatchToTextures(ctx, items.as_mut_ptr(), items.len() as u32, &mut fence);
+        assert_eq!(queued, jobs.len() as i32, "Expected {} queued, got {queued}", jobs.len());
+        assert_eq!(items[jobs.len()].status, -1, "Expected isolated -1 error");
+        assert_eq!(BcPackWaitDirectFence(ctx, fence, u32::MAX), 0);
+
+        for (ji, job) in jobs.iter().enumerate() {
+            assert_eq!(items[ji].status, 0, "Item {ji} failed");
+            if job.mip_levels == 1 {
+                let got = readback_bc_texture2d(&mut gpu, &job.tex, job.dxgi, job.wb, job.hb, job.blk_bytes);
+                assert_eq!(got, job.expected, "BatchToTextures mismatch on job {ji} ({:?})", job.mode);
+            }
+        }
+        // Verify both mips of shared destination texture using subresource-aware readback helper
+        for (mip_idx, wb, hb) in [(0u32, 64u32, 64u32), (1u32, 32u32, 32u32)] {
+            let job = jobs.iter().find(|j| j.mip_levels == 2 && j.subresource == mip_idx).unwrap();
+            let raw_row = (wb as usize) * 16;
+            let aligned_pitch = (raw_row + 255) & !255;
+            let rb = create_committed_buffer(
+                &gpu.device,
+                D3D12_HEAP_TYPE_READBACK,
+                (aligned_pitch * hb as usize) as u64,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            let alloc: ID3D12CommandAllocator = gpu.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cmd: ID3D12GraphicsCommandList = gpu.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            cmd_barriers(&cmd, vec![transition_barrier(&job.tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let mut src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(job.tex.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: mip_idx },
+            };
+            let mut dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(rb.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_BC7_UNORM,
+                            Width: wb * 4,
+                            Height: hb * 4,
+                            Depth: 1,
+                            RowPitch: aligned_pitch as u32,
+                        },
+                    },
+                },
+            };
+            cmd.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            let _ = ManuallyDrop::take(&mut src_loc.pResource);
+            let _ = ManuallyDrop::take(&mut dst_loc.pResource);
+            cmd_barriers(&cmd, vec![transition_barrier(&job.tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            cmd.Close().unwrap();
+            gpu.queue.ExecuteCommandLists(&[Some(cmd.cast::<ID3D12CommandList>().unwrap())]);
+            gpu.signal_and_wait();
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            rb.Map(0, Some(&D3D12_RANGE { Begin: 0, End: aligned_pitch * hb as usize }), Some(&mut ptr)).unwrap();
+            let mut got = Vec::with_capacity((wb * hb) as usize * 16);
+            for r in 0..hb as usize {
+                got.extend_from_slice(std::slice::from_raw_parts((ptr as *const u8).add(r * aligned_pitch), raw_row));
+            }
+            rb.Unmap(0, None);
+            assert_eq!(got, job.expected, "BatchToTextures multi-mip mismatch at mip {mip_idx}");
+        }
+
+        // Throughput micro-benchmark: 128 x 512x512 BC1 (16.0 MiB) BatchToTextures vs ToTexture2D loop
+        let bc1_streams: Vec<Vec<u8>> = (0..16)
+            .map(|k| encode_synthetic_chunk(BcpMode::Bc1, 16_384, 0x7E57_0000 + k as u64, &ctrl7))
+            .collect();
+        let tex_ring: Vec<ID3D12Resource> = (0..8)
+            .map(|_| create_bc_texture2d(&gpu.device, DXGI_FORMAT_BC1_UNORM, 128, 128))
+            .collect();
+        let mut bench_items: Vec<BcPackTextureBatchItem> = (0..128)
+            .map(|i| BcPackTextureBatchItem {
+                compressed_data: bc1_streams[i % 16].as_ptr(),
+                compressed_size: bc1_streams[i % 16].len() as u32,
+                num_blocks: 16_384,
+                format: BCPACK_FORMAT_BC1,
+                swizzle_mode: BCPACK_SWIZZLE_LINEAR,
+                width_blocks: 128,
+                height_blocks: 128,
+                dst_texture2d: tex_ring[i % 8].as_raw(),
+                subresource_index: 0,
+                dst_x_blocks: 0,
+                dst_y_blocks: 0,
+                status: 0,
+            })
+            .collect();
+
+        let t_batch_tex = Instant::now();
+        let mut bfence = 0u64;
+        let b_ok = BcPackDecodeBatchToTextures(ctx, bench_items.as_mut_ptr(), bench_items.len() as u32, &mut bfence);
+        assert_eq!(b_ok, 128);
+        assert_eq!(BcPackWaitDirectFence(ctx, bfence, u32::MAX), 0);
+        let batch_tex_ms = t_batch_tex.elapsed().as_secs_f64() * 1000.0;
+        let batch_tex_mbs = 16.0 / (batch_tex_ms / 1000.0);
+
+        println!(
+            "[v15-batch-to-tex2d] 10/11 mixed items (6 formats + SW_64KB_D + 64x64 RowPitch + multi-mip + 1 isolated err): 0 byte mismatches | 16.0 MiB (128x512x512 BC1): {batch_tex_ms:.2} ms ({batch_tex_mbs:.1} MB/s)"
+        );
+
         bcpack_gpu_destroy(ctx);
     }
 }

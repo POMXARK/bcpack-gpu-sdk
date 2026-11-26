@@ -187,6 +187,33 @@ BCPACK_API int32_t BcPackDecodeBatch(
     uint32_t         count,
     double*          out_total_kernel_ms);
 
+typedef struct BcPackTextureBatchItem {
+    const uint8_t* compressed_data;
+    uint32_t       compressed_size;
+    uint32_t       num_blocks;
+    uint32_t       format;            // BCPACK_FORMAT_BC1, BC3, BC4, BC5, BC6H, or BC7
+    uint32_t       swizzle_mode;      // BCPACK_SWIZZLE_LINEAR, GFX10_64KB_D, or GFX10_4KB_S
+    uint32_t       width_blocks;
+    uint32_t       height_blocks;
+    void*          dst_texture2d;     // ID3D12Resource* (in D3D12_RESOURCE_STATE_COMMON; restored to COMMON)
+    uint32_t       subresource_index;
+    uint32_t       dst_x_blocks;
+    uint32_t       dst_y_blocks;
+    int32_t        status;            // written per item: 0 = queued/ok, < 0 = error (-1/-4/-5/-6)
+} BcPackTextureBatchItem;
+
+// Decodes a batch of mixed-format BCPack streams directly into destination ID3D12Resource 2D textures
+// with optional Gfx10 detiling and automatic 256B RowPitch padding — zero per-item CPU waits.
+// Groups items by pipeline family, runs Compute decode + Compute detile -> 1 GPU Queue::Wait -> 1 Direct
+// CopyTextureRegion command list -> 1 Direct fence signal stored in *out_direct_fence_value.
+// Each item's validation/dispatch result is written to item->status (0 on success, < 0 on error).
+// Returns count of items queued (>= 0), or < 0 if ctx/items is invalid.
+BCPACK_API int32_t BcPackDecodeBatchToTextures(
+    BcPackContext*          ctx,
+    BcPackTextureBatchItem* items,
+    uint32_t                count,
+    uint64_t*               out_direct_fence_value);
+
 #ifdef __cplusplus
 }
 #endif
