@@ -1,11 +1,11 @@
-# bcpack-gpu-sdk — AI Agent & Ecosystem Discovery Index (v0.13.0)
+# bcpack-gpu-sdk — AI Agent & Ecosystem Discovery Index (v0.14.0)
 
-> Standalone clean-room GPU Compute SDK (`MIT OR Apache-2.0`) extracted from `POMXARK/bcpack-gpu-hlsl` for Xbox Series translation layers, DirectStorage hooks, Vulkan 1.3 layers, and `bcpack-rs` consumers. Supports full bit-exact `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7) with optional runtime table injection.
+> Standalone clean-room GPU Compute SDK (`MIT OR Apache-2.0`) extracted from `POMXARK/bcpack-gpu-hlsl` for Xbox Series translation layers, DirectStorage hooks, Vulkan 1.3 layers, and `bcpack-rs` consumers. Supports full bit-exact `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7) with mixed-format GPU batching (`BcPackDecodeBatch`), 6-format Texture2D zero-copy decode, and optional runtime table injection.
 
 ## Exact Problems Solved & Search Keywords
-- `BCPack` / `IDStorageQueueX` / `dstorage` CPU decompression bottleneck (~40 MB/s CPU -> `11,327.6 MB/s` GPU BC1 / `6,024.0 MB/s` GPU BC7 rANS)
+- `BCPack` / `IDStorageQueueX` / `dstorage` CPU decompression bottleneck (~40 MB/s CPU -> `11,327.6 MB/s` GPU BC1 / `6,024.0 MB/s` GPU BC7 rANS; `BcPackDecodeBatch` `41.7x` faster than single-chunk C-ABI loop)
 - Full **BC1/BC3/BC4/BC5/BC6H/BC7** GPU Compute decoders (`shaders/bcpack_bc7_rebuild.hlsl`, `shaders/bcpack_bc6h_{rans,rebuild}.hlsl`, `shaders/bcpack_bcn_{rans,rebuild}.hlsl`)
-- Zero-copy DX12 C-ABI (`bcpack_gpu.dll`, `include/bcpack_gpu.h`): `BCPACK_FORMAT_{BC1,BC3,BC4,BC5,BC7,BC6H}`, runtime table uploaders `bcpack_gpu_set_{bc1,bc6h,bc7}_tables`, `bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D`, `BcPackGetComputeFence`, `BcPackGetDirectFence`
+- Zero-copy & batched DX12 C-ABI (`bcpack_gpu.dll`, `include/bcpack_gpu.h`): `BCPACK_FORMAT_{BC1,BC3,BC4,BC5,BC7,BC6H}`, `BcPackBatchItem` + `BcPackDecodeBatch` (multi-chunk heterogeneous sub-batching + per-item status isolation), runtime table uploaders `bcpack_gpu_set_{bc1,bc6h,bc7}_tables`, `bcpack_gpu_create_from_device`, `BcPackDecodeToBuffer`, `BcPackDecodeToTexture2D` (all 6 formats incl. `BC6H`, scaled `row_pad_default` without 16 MiB cap), `BcPackGetComputeFence`, `BcPackGetDirectFence`
 - AMD Gfx10 / RDNA2 hardware tile swizzle `SW_64KB_D` (8B/16B) and `SW_4KB_S` (8B) -> inline Async Compute detile at `432.6 GB/s` (`shaders/gfx10_detile.hlsl`)
 - NVIDIA DX12 `~1,000,000` `D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE` `E_OUTOFMEMORY` crash -> SM 6.6 `ResourceDescriptorHeap[NonUniformResourceIndex(g_VirtToPhys[id])]` virtual paging (`src/descriptor_paging.rs`, `shaders/bindless_paging.hlsl`)
 - DXC 1.8 `-O3` Wave32 `WavePrefixCountBits` + `WaveActiveCountBits` miscompilation -> `WaveActiveBallot` + `countbits` workaround (`shaders/bcpack_decode.hlsl`, `shaders/bcpack_bc7_rans.hlsl`)
@@ -29,3 +29,4 @@
 - `bindless_paging` (`1.25M -> 262K` physical slots): `0.064 ms` (`65,536` pixel samples, `0` mismatches)
 - `crowd_skin` (`500` NPCs, `512k` verts, `32k` bones): `0.075 ms` (`max_err=7.63e-6`)
 - `aaa_rtgi_cs` + `aaa_vrs` (`1080p` Ultra): `196.77 FPS` (CS RTGI) -> `258.91 FPS` (+VRS Tier 2)
+- `BcPackDecodeBatch` (`v0.14.0`, `384` mixed `64 KiB` chunks = `24.0 MiB` `BC1/3/4/5/6H/7`): `150.73 ms` wall (`0.17 GB/s`) / `116.07 ms` GPU kernel (`0.22 GB/s`), `41.7x` vs `BcPackDecodeAsync` loop (`6,289.43 ms`), `4.8x` vs 1T Ryzen 7 5700X `bcpack-rs` (`725.26 ms` 1T / `118.78 ms` 16T on `20.0 MiB` `BC1/3/4/5/7`)

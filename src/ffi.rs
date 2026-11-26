@@ -45,7 +45,14 @@ pub struct BcPackContext {
     detile_cmd: ID3D12GraphicsCommandList,
     tex_copy_alloc: ID3D12CommandAllocator,
     tex_copy_cmd: ID3D12GraphicsCommandList,
+    max_chunks: usize,
+    max_blocks: usize,
+    max_bcn_sym_rows: usize,
+    max_bc7_blocks: usize,
+    max_bc6h_blocks: usize,
+    max_stream_bytes: usize,
     max_output_bytes: usize,
+    max_row_pad_bytes: usize,
     last_kernel_ms: f64,
 }
 
@@ -124,7 +131,7 @@ unsafe fn init_context_with_gpu(
     let row_pad_default = create_committed_buffer(
         &ctx.device,
         D3D12_HEAP_TYPE_DEFAULT,
-        16 * 1024 * 1024,
+        out_bytes as u64,
         D3D12_RESOURCE_FLAG_NONE,
         D3D12_RESOURCE_STATE_COMMON,
     );
@@ -164,7 +171,14 @@ unsafe fn init_context_with_gpu(
         detile_cmd,
         tex_copy_alloc,
         tex_copy_cmd,
+        max_chunks: chunks,
+        max_blocks: blocks,
+        max_bcn_sym_rows: bc7_sym_rows,
+        max_bc7_blocks: (out_bytes / 16).max(4096),
+        max_bc6h_blocks: (out_bytes / 16).max(4096),
+        max_stream_bytes: stream_cap,
         max_output_bytes: out_bytes,
+        max_row_pad_bytes: out_bytes,
         last_kernel_ms: 0.0,
     }))
 }
@@ -636,11 +650,25 @@ pub unsafe extern "C" fn BcPackDecodeToTexture2D(
     {
         return -1;
     }
-    if format_layout(format).is_none() {
-        return -4;
-    }
+    let (chk_block_bytes, _) = match format_layout(format) {
+        Some(v) => v,
+        None => return -4,
+    };
     let res = catch_unwind(AssertUnwindSafe(|| -> i32 {
         let state = &mut *ctx;
+        let raw_row = match width_blocks.checked_mul(chk_block_bytes as u32) {
+            Some(v) => v,
+            None => return -5,
+        };
+        let aligned_pitch = match raw_row.checked_add(255) {
+            Some(v) => v & !255,
+            None => return -5,
+        };
+        let total_padded_bytes = (aligned_pitch as u64) * (height_blocks as u64);
+        if aligned_pitch != raw_row && total_padded_bytes > (state.max_row_pad_bytes as u64) {
+            return -5;
+        }
+
         if state.ctx.compute_fence_value > 0 {
             let _ = state.ctx.wait_compute_cpu(state.ctx.compute_fence_value, INFINITE);
         }
@@ -650,7 +678,7 @@ pub unsafe extern "C" fn BcPackDecodeToTexture2D(
         let dst_tex: ID3D12Resource = (*ManuallyDrop::new(ID3D12Resource::from_raw(dst_texture2d))).clone();
         let stream = std::slice::from_raw_parts(compressed_data, compressed_size as usize);
 
-        let (src_buf, block_bytes, dxgi_fmt, _, compute_val) = match submit_format_compute_to_internal(
+        let (src_buf, _, dxgi_fmt, _, compute_val) = match submit_format_compute_to_internal(
             state,
             stream,
             num_blocks,
@@ -669,13 +697,6 @@ pub unsafe extern "C" fn BcPackDecodeToTexture2D(
             .queue
             .Wait(&state.ctx.compute_fence, compute_val)
             .expect("DIRECT queue Wait compute_fence");
-
-        let raw_row = width_blocks * (block_bytes as u32);
-        let aligned_pitch = (raw_row + 255) & !255;
-        let total_padded_bytes = (aligned_pitch as u64) * (height_blocks as u64);
-        if total_padded_bytes > 16 * 1024 * 1024 {
-            return -5;
-        }
 
         state.tex_copy_alloc.Reset().unwrap();
         state.tex_copy_cmd.Reset(&state.tex_copy_alloc, None).unwrap();
@@ -895,4 +916,292 @@ pub unsafe extern "C" fn BcPackGetLastTimingMs(
     }
     *out_kernel_ms = (*ctx).last_kernel_ms;
     0
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BcPackBatchItem {
+    pub compressed_data: *const u8,
+    pub compressed_size: u32,
+    pub num_blocks: u32,
+    pub format: u32,
+    pub swizzle_mode: u32,
+    pub width_blocks: u32,
+    pub height_blocks: u32,
+    pub out_host_buffer: *mut u8,
+    pub out_capacity: u32,
+    pub status: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchFamily {
+    Bc1Fast,
+    Bcn,
+    Bc7,
+    Bc6h,
+}
+
+#[inline]
+fn align4(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackDecodeBatch(
+    ctx: *mut BcPackContext,
+    items: *mut BcPackBatchItem,
+    count: u32,
+    out_total_kernel_ms: *mut f64,
+) -> i32 {
+    if ctx.is_null() {
+        return -1;
+    }
+    if count == 0 {
+        let state = &mut *ctx;
+        state.last_kernel_ms = 0.0;
+        if !out_total_kernel_ms.is_null() {
+            *out_total_kernel_ms = 0.0;
+        }
+        return 0;
+    }
+    if items.is_null() {
+        return -1;
+    }
+
+    let res = catch_unwind(AssertUnwindSafe(|| -> i32 {
+        let state = &mut *ctx;
+        if state.ctx.compute_fence_value > 0 {
+            let _ = state.ctx.wait_compute_cpu(state.ctx.compute_fence_value, INFINITE);
+        }
+
+        let slice = std::slice::from_raw_parts_mut(items, count as usize);
+        let mut bc1_indices: Vec<usize> = Vec::new();
+        let mut bcn_indices: Vec<usize> = Vec::new();
+        let mut bc7_indices: Vec<usize> = Vec::new();
+        let mut bc6h_indices: Vec<usize> = Vec::new();
+
+        let max_chunks = state.max_chunks.max(1);
+        let max_stream = state.max_stream_bytes;
+
+        for (idx, item) in slice.iter_mut().enumerate() {
+            item.status = -1;
+            if item.compressed_data.is_null()
+                || item.compressed_size == 0
+                || item.num_blocks == 0
+                || item.out_host_buffer.is_null()
+            {
+                item.status = -1;
+                continue;
+            }
+            if item.swizzle_mode != BCPACK_SWIZZLE_LINEAR {
+                item.status = -4;
+                continue;
+            }
+            let (block_bytes, _) = match format_layout(item.format) {
+                Some(v) => v,
+                None => {
+                    item.status = -4;
+                    continue;
+                }
+            };
+            let blocks = item.num_blocks as usize;
+            let out_bytes = match blocks.checked_mul(block_bytes) {
+                Some(v) => v,
+                None => {
+                    item.status = -5;
+                    continue;
+                }
+            };
+            if (item.out_capacity as usize) < out_bytes {
+                item.status = -2;
+                continue;
+            }
+
+            let stream_padded = match align4(item.compressed_size as usize).checked_add(256) {
+                Some(v) => v,
+                None => {
+                    item.status = -5;
+                    continue;
+                }
+            };
+            if stream_padded > max_stream {
+                item.status = -5;
+                continue;
+            }
+
+            let family = match item.format {
+                BCPACK_FORMAT_BC1 if !state.bc1_use_full_bcn => {
+                    if blocks > state.max_blocks {
+                        item.status = -5;
+                        continue;
+                    }
+                    BatchFamily::Bc1Fast
+                }
+                BCPACK_FORMAT_BC7 => {
+                    if blocks > state.max_bc7_blocks || out_bytes > state.max_output_bytes {
+                        item.status = -5;
+                        continue;
+                    }
+                    BatchFamily::Bc7
+                }
+                BCPACK_FORMAT_BC6H => {
+                    if blocks > state.max_bc6h_blocks || out_bytes > state.max_output_bytes {
+                        item.status = -5;
+                        continue;
+                    }
+                    BatchFamily::Bc6h
+                }
+                _ => {
+                    let mode = match bcn_mode_from_format(item.format) {
+                        Some(m) => m,
+                        None => {
+                            item.status = -4;
+                            continue;
+                        }
+                    };
+                    let sym_rows = match blocks.checked_mul(mode.symbols_per_block()) {
+                        Some(v) => v,
+                        None => {
+                            item.status = -5;
+                            continue;
+                        }
+                    };
+                    if sym_rows > state.max_bcn_sym_rows || out_bytes > state.max_output_bytes {
+                        item.status = -5;
+                        continue;
+                    }
+                    BatchFamily::Bcn
+                }
+            };
+
+            match family {
+                BatchFamily::Bc1Fast => bc1_indices.push(idx),
+                BatchFamily::Bcn => bcn_indices.push(idx),
+                BatchFamily::Bc7 => bc7_indices.push(idx),
+                BatchFamily::Bc6h => bc6h_indices.push(idx),
+            }
+        }
+
+        let mut succeeded = 0i32;
+        let mut total_kernel_ms = 0.0f64;
+
+        let groups = [
+            (BatchFamily::Bc1Fast, bc1_indices),
+            (BatchFamily::Bcn, bcn_indices),
+            (BatchFamily::Bc7, bc7_indices),
+            (BatchFamily::Bc6h, bc6h_indices),
+        ];
+
+        for (family, indices) in groups {
+            if indices.is_empty() {
+                continue;
+            }
+            let (unit_cap, out_cap) = match family {
+                BatchFamily::Bc1Fast => (state.max_blocks, state.max_blocks * 8),
+                BatchFamily::Bcn => (state.max_bcn_sym_rows, state.max_output_bytes),
+                BatchFamily::Bc7 => (state.max_bc7_blocks * 2, state.max_output_bytes),
+                BatchFamily::Bc6h => (state.max_bc6h_blocks * 2, state.max_output_bytes),
+            };
+
+            let mut start = 0usize;
+            while start < indices.len() {
+                let mut end = start;
+                let mut sub_units = 0usize;
+                let mut sub_out = 0usize;
+                let mut sub_stream = 0usize;
+
+                while end < indices.len() && (end - start) < max_chunks {
+                    let item = &slice[indices[end]];
+                    let blocks = item.num_blocks as usize;
+                    let (item_units, item_out) = match family {
+                        BatchFamily::Bc1Fast => (blocks, blocks * 8),
+                        BatchFamily::Bc7 | BatchFamily::Bc6h => (blocks * 2, blocks * 16),
+                        BatchFamily::Bcn => {
+                            let mode = bcn_mode_from_format(item.format).unwrap();
+                            (blocks * mode.symbols_per_block(), blocks * mode.block_bytes())
+                        }
+                    };
+                    let item_stream = align4(item.compressed_size as usize);
+                    if end > start
+                        && (sub_units + item_units > unit_cap
+                            || sub_out + item_out > out_cap
+                            || sub_stream + item_stream + 256 > max_stream)
+                    {
+                        break;
+                    }
+                    sub_units += item_units;
+                    sub_out += item_out;
+                    sub_stream += item_stream;
+                    end += 1;
+                }
+
+                let sub = &indices[start..end];
+                let (decoded, statuses, kms) = match family {
+                    BatchFamily::Bc1Fast => {
+                        let batch = pack_batch(sub.iter().map(|&i| {
+                            let it = &slice[i];
+                            let s = std::slice::from_raw_parts(it.compressed_data, it.compressed_size as usize);
+                            (s, it.num_blocks as usize)
+                        }));
+                        let (d, st, k, _) = state.bc1_dec.decode_batch_and_readback(&mut state.ctx, &batch);
+                        (d, st, k)
+                    }
+                    BatchFamily::Bc7 => {
+                        let batch = pack_batch(sub.iter().map(|&i| {
+                            let it = &slice[i];
+                            let s = std::slice::from_raw_parts(it.compressed_data, it.compressed_size as usize);
+                            (s, (it.num_blocks as usize) * 2)
+                        }));
+                        let (d, st, k, _) = state.bc7_full.decode_batch_and_readback(&mut state.ctx, &batch);
+                        (d, st, k)
+                    }
+                    BatchFamily::Bc6h => {
+                        let batch = pack_batch(sub.iter().map(|&i| {
+                            let it = &slice[i];
+                            let s = std::slice::from_raw_parts(it.compressed_data, it.compressed_size as usize);
+                            (s, (it.num_blocks as usize) * 2)
+                        }));
+                        let (d, st, k, _) = state.bc6h_full.decode_batch_and_readback(&mut state.ctx, &batch);
+                        (d, st, k)
+                    }
+                    BatchFamily::Bcn => {
+                        let batch = pack_bcn_batch(sub.iter().map(|&i| {
+                            let it = &slice[i];
+                            let s = std::slice::from_raw_parts(it.compressed_data, it.compressed_size as usize);
+                            let mode = bcn_mode_from_format(it.format).unwrap();
+                            (s, mode, it.num_blocks as usize)
+                        }));
+                        let (d, st, k, _) = state.bcn_dec.decode_batch_and_readback(&mut state.ctx, &batch);
+                        (d, st, k)
+                    }
+                };
+
+                total_kernel_ms += kms;
+                let mut byte_off = 0usize;
+                for (k, &idx) in sub.iter().enumerate() {
+                    let item = &mut slice[idx];
+                    let (blk_bytes, _) = format_layout(item.format).unwrap();
+                    let item_out = (item.num_blocks as usize) * blk_bytes;
+                    let code = statuses.get(k).map(|s| s.code).unwrap_or(99);
+                    if code == 0 && byte_off + item_out <= decoded.len() {
+                        copy_nonoverlapping(decoded.as_ptr().add(byte_off), item.out_host_buffer, item_out);
+                        item.status = 0;
+                        succeeded += 1;
+                    } else {
+                        item.status = -3;
+                    }
+                    byte_off += item_out;
+                }
+
+                start = end;
+            }
+        }
+
+        state.last_kernel_ms = total_kernel_ms;
+        if !out_total_kernel_ms.is_null() {
+            *out_total_kernel_ms = total_kernel_ms;
+        }
+        succeeded
+    }));
+    res.unwrap_or(-99)
 }

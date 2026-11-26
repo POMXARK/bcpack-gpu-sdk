@@ -8,7 +8,7 @@
 
 **Standalone, bloat-free clean-room hardware GPU compute SDK (`MIT OR Apache-2.0`) for Xbox Series X|S translation layers, DirectStorage `IDStorageQueueX` hooks, Vulkan 1.3 Linux layers (`OpenScarlett` / Proton), and GPU backends for [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs).**
 
-No game assets, no demo media bloat, zero copyrighted data — only the production C-ABI DLL (`bcpack_gpu.dll`), Rust crate (`bcpack-gpu-sdk` `v0.13.0`), `include/bcpack_gpu.h`, **15 HLSL SM 6.6 + DXIL compute kernels**, and **14 precompiled Vulkan 1.3 SPIR-V (`.spv`) kernels** supporting **all 6 BCPack formats: Full `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7)** with optional caller-supplied runtime table uploads.
+No game assets, no demo media bloat, zero copyrighted data — only the production C-ABI DLL (`bcpack_gpu.dll`), Rust crate (`bcpack-gpu-sdk` `v0.14.0`), `include/bcpack_gpu.h`, **15 HLSL SM 6.6 + DXIL compute kernels**, and **14 precompiled Vulkan 1.3 SPIR-V (`.spv`) kernels** supporting **all 6 BCPack formats: Full `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7)** with mixed-format GPU batching (`BcPackDecodeBatch`) and optional caller-supplied runtime table uploads.
 
 > Looking for the full 4K streaming benchmark, 12.41M Mesh-Shader showcase, MP4/GIF captures, and 19-test verification harness? See the companion showcase repository: **[`POMXARK/bcpack-gpu-hlsl`](https://github.com/POMXARK/bcpack-gpu-hlsl)** (which links this SDK via Git submodule at `sdk/`).
 > AI coding agents & crawlers: read **[`llms.txt`](llms.txt)** and **[`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md)**.
@@ -25,8 +25,9 @@ No game assets, no demo media bloat, zero copyrighted data — only the producti
    - [`shaders/bcpack_bc6h_rans.hlsl`](shaders/bcpack_bc6h_rans.hlsl) + [`shaders/bcpack_bc6h_rebuild.hlsl`](shaders/bcpack_bc6h_rebuild.hlsl) (`Bc6hFullGpuDecoder` / `BCPACK_FORMAT_BC6H`): 16-lane Wave32 rANS + all 14 BC6H HDR modes (`1..14`), ascending high base bits (`13..14`), signed index deltas, 255-entry dictionary, and 256-block history ring.
    - [`shaders/bcpack_bcn_rans.hlsl`](shaders/bcpack_bcn_rans.hlsl) + [`shaders/bcpack_bcn_rebuild.hlsl`](shaders/bcpack_bcn_rebuild.hlsl) (`BcnGpuDecoder` / `BCPACK_FORMAT_BC3`, `BC4`, `BC5`, and full-table `BC1`): generalized 12-lane Wave32 rANS + pair/quad rank tables + dictionary/history rebuild.
    - [`shaders/bc16_pack.hlsl`](shaders/bc16_pack.hlsl) + [`shaders/gfx10_detile.hlsl`](shaders/gfx10_detile.hlsl): inline RDNA2 bit-permutation detile (`SW_64KB_D` 8B/16B, `SW_4KB_S` 8B at **`432.6 GB/s`**) on `D3D12_COMMAND_LIST_TYPE_COMPUTE` before `CopyTextureRegion`.
-3. **Zero-Copy Shared-Device C-ABI & Runtime Table Upload (`bcpack_gpu.dll` + `include/bcpack_gpu.h`):**
-   - Attach directly to a caller's `ID3D12Device*` (`bcpack_gpu_create_from_device`) and decode + detile straight into `D3D12_HEAP_TYPE_DEFAULT` buffers (`BcPackDecodeToBuffer`) or `DXGI_FORMAT_BC{1,3,4,5,6H_UF16,7}_UNORM` 2D subresources (`BcPackDecodeToTexture2D`, automatic `256B` row-pitch padding) synchronized via cross-queue `ID3D12Fence` (`0` CPU readback).
+3. **Zero-Copy & Batched Shared-Device C-ABI (`bcpack_gpu.dll` + `include/bcpack_gpu.h`):**
+   - Attach directly to a caller's `ID3D12Device*` (`bcpack_gpu_create_from_device`) and decode + detile straight into `D3D12_HEAP_TYPE_DEFAULT` buffers (`BcPackDecodeToBuffer`) or `DXGI_FORMAT_BC{1,3,4,5,6H_UF16,7}_UNORM` 2D subresources (`BcPackDecodeToTexture2D`, automatic `256B` row-pitch padding scaled to context output capacity, `0` hardcoded `16 MiB` limit) synchronized via cross-queue `ID3D12Fence` (`0` CPU readback).
+   - Submit heterogeneous multi-chunk batches via `BcPackDecodeBatch` (`BcPackBatchItem` array across `BC1/BC3/BC4/BC5/BC6H/BC7`): groups items by pipeline family (`Bc1Fast`, `Bcn`, `Bc6h`, `Bc7`), auto sub-batches within context caps, isolates invalid items per `item.status`, and eliminates per-chunk dispatch overhead (**`41.7×` faster** than looping `BcPackDecodeAsync`).
    - Callers with external Xbox BCPack tables can upload them cleanly at runtime via `bcpack_gpu_set_bc1_tables`, `bcpack_gpu_set_bc6h_tables`, and `bcpack_gpu_set_bc7_tables` (`0` proprietary constants embedded).
 4. **SM 6.6 Virtual `ResourceDescriptorHeap[]` Pager (`1.25M → 262K` slots in `0.064 ms`):**
    - Solves NVIDIA DX12 `~1M` shader-visible descriptor heap `E_OUTOFMEMORY` crashes via `CopyDescriptorsSimple` LRU paging + `ResourceDescriptorHeap[NonUniformResourceIndex(g_VirtToPhys[id])]`.
@@ -39,7 +40,7 @@ No game assets, no demo media bloat, zero copyrighted data — only the producti
 
 ### 1. C / C++ Zero-Copy DirectStorage / DX12 Hook (`bcpack_gpu.dll`)
 
-Download `bcpack-gpu-sdk-v0.11.0-win64-spirv.zip` from [Releases](https://github.com/POMXARK/bcpack-gpu-sdk/releases) (or build with `cargo build --release`), then link `bcpack_gpu.dll.lib`:
+Download `bcpack_gpu.dll`, `bcpack_gpu.dll.lib`, and `bcpack_gpu.h` from [Releases](https://github.com/POMXARK/bcpack-gpu-sdk/releases) (or build with `cargo build --release`), then link `bcpack_gpu.dll.lib`:
 
 ```c
 #include "bcpack_gpu.h"
@@ -81,7 +82,7 @@ All 9 core compute kernels are precompiled with official Microsoft `DirectXShade
 
 ```toml
 [dependencies]
-bcpack-gpu-sdk = { git = "https://github.com/POMXARK/bcpack-gpu-sdk.git", tag = "v0.11.0" }
+bcpack-gpu-sdk = { git = "https://github.com/POMXARK/bcpack-gpu-sdk.git", tag = "v0.14.0" }
 ```
 
 ```rust
@@ -115,13 +116,31 @@ git submodule add https://github.com/POMXARK/bcpack-gpu-sdk.git sdk
 | `hiz_cull.{hlsl,dxil}` | SM 6.6 | `64` | `t0..t8`, `u0`, `b0` | Frustum + 4-texel Hi-Z bounding sphere occlusion test |
 | `aaa_vrs.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `8×8` | `t0`, `t1`, `u0` (`R8_UINT`), `b0` | VRS Tier 2 (`16×16`) motion/luma/sky rate map |
 | `aaa_rtgi_cs.{hlsl,dxil,spv}` | SM 6.6, VK 1.3 | `8×8` (`VK_KHR_ray_query`) | `t0..t6` (`t2`=TLAS), `u0`, `b0` | Coalesced Compute `RayQuery` diffuse GI |
-| `src/ffi.rs` + `include/bcpack_gpu.h` | `cdylib` (`Win64`) | Async Compute + Direct | C-ABI opaque `BcPackContext*` | `bcpack_gpu_create_from_device`, `BcPackDecodeToTexture2D`, `BcPackDecodeToBuffer` |
+| `src/ffi.rs` + `include/bcpack_gpu.h` | `cdylib` (`Win64`) | Async Compute + Direct | C-ABI opaque `BcPackContext*` | `bcpack_gpu_create_from_device`, `BcPackDecodeBatch`, `BcPackDecodeToTexture2D`, `BcPackDecodeToBuffer` |
 
 ---
 
 ## Verified Hardware Benchmarks (NVIDIA RTX 5080)
 
-All measurements taken with **DX12 Debug Layer (`0` errors)** verified against [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) CPU reference oracle (**`21/21 PASS`**, `0` byte/symbol mismatches):
+All measurements verified against [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs) CPU reference oracle (**`0` byte/symbol mismatches**):
+
+### `v0.14.0` C-ABI Mixed-Format Batch & Texture2D (`tests/v14_batch_and_tex2d.rs`)
+
+- **Correctness (`3/3 PASS`, `0` byte mismatches):**
+  - `BcPackDecodeToTexture2D`: all **6 formats (`BC1/BC3/BC4/BC5/BC6H/BC7`)** at `256×256 px` and unaligned `12×12 px` (`row_pad_default`), plus `>16 MiB` row-padded `2052×8192 px` BC7 (`16.03 MiB` raw / `16.50 MiB` padded in 64 strips), `4096×4096 px` BC7 (`16.00 MiB` in 64 strips via `dst_y_blocks`), and pre-submission `-5` bounds guard (`>128 MiB`).
+  - `BcPackDecodeBatch`: `62/66` mixed `BC1/BC3/BC4/BC5/BC6H/BC7` chunks auto-sub-batched (`max_chunks=16`) + `4` isolated error items (`-2`, `-4`, `-4`, `-1`) with `0` byte mismatches (`kernel=6.868 ms`).
+- **Throughput (`384` realistic `64 KiB` chunks = `24.0 MiB` mixed 6-fmt; CPU subset = `320` chunks / `20.0 MiB` `BC1/3/4/5/7` on Ryzen 7 5700X):**
+
+| Path / API | Scale | Latency | Throughput | Notes |
+|---|---|---:|---:|---|
+| CPU `bcpack-rs` (`1` thread) | `20.0 MiB` (`BC1/3/4/5/7`) | `725.26 ms` | `0.03 GB/s` | Baseline CPU decoder |
+| CPU `bcpack-rs` (`16` threads) | `20.0 MiB` (`BC1/3/4/5/7`) | `118.78 ms` | `0.18 GB/s` | Full 8C/16T Ryzen 7 5700X |
+| GPU `BcPackDecodeAsync` loop | `24.0 MiB` (`384` calls) | `6,289.43 ms` | `< 0.01 GB/s` | 1-chunk submit/sync overhead |
+| **GPU `BcPackDecodeBatch` (wall)** | `24.0 MiB` (`384` chunks) | **`150.73 ms`** | **`0.17 GB/s`** | **`41.7×` faster** than async loop, `4.8×` vs 1T CPU |
+| **GPU `BcPackDecodeBatch` (kernel)** | `24.0 MiB` (`384` chunks) | **`116.07 ms`** | **`0.22 GB/s`** | Cumulative DX12 GPU timestamps |
+| GPU `BcPackDecodeToTexture2D` | `8.0 MiB` (`32 × 512px` BC7) | `4,434.58 ms` | `< 0.01 GB/s` | Zero-copy per-texture DX12 copy |
+
+### Core Kernel Suite (`DX12 Debug Layer: 0 Errors`, `21/21 PASS`)
 
 | Workload / Kernel | Output / Scale | CPU 1-Core Baseline | `bcpack-gpu-sdk` (RTX 5080) | Speedup / Notes |
 |---|---|---:|---:|---|

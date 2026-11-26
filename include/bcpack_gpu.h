@@ -113,7 +113,7 @@ BCPACK_API int32_t BcPackDecodeToBuffer(
 // - Executes BCPack decode (+ detile) on the Async Compute queue, performs GPU Queue::Wait onto DIRECT, and issues CopyTextureRegion
 //   (automatically padding row pitches to 256B for small mip levels).
 // - dst_texture2d MUST live on the shared device and enter in D3D12_RESOURCE_STATE_COMMON (restored to COMMON on exit).
-// - Signals *out_fence_value on BcPackGetDirectFence(ctx). Supports BCPACK_FORMAT_BC1, BC3, BC4, BC5, and BC7.
+// - Signals *out_fence_value on BcPackGetDirectFence(ctx). Supports BCPACK_FORMAT_BC1, BC3, BC4, BC5, BC6H, and BC7.
 BCPACK_API int32_t BcPackDecodeToTexture2D(
     BcPackContext* ctx,
     const uint8_t* compressed_data,
@@ -161,6 +161,31 @@ BCPACK_API int32_t BcPackWaitFence(
 BCPACK_API int32_t BcPackGetLastTimingMs(
     const BcPackContext* ctx,
     double* out_kernel_ms);
+
+typedef struct BcPackBatchItem {
+    const uint8_t* compressed_data;
+    uint32_t       compressed_size;
+    uint32_t       num_blocks;
+    uint32_t       format;          // BCPACK_FORMAT_BC1, BC3, BC4, BC5, BC6H, or BC7
+    uint32_t       swizzle_mode;    // BCPACK_SWIZZLE_LINEAR (non-linear rejected per item with -4)
+    uint32_t       width_blocks;    // optional (reserved for future batch detile)
+    uint32_t       height_blocks;   // optional (reserved for future batch detile)
+    uint8_t*       out_host_buffer;
+    uint32_t       out_capacity;
+    int32_t        status;          // written per item: 0 = ok, < 0 = error (-1/-2/-3/-4/-5)
+} BcPackBatchItem;
+
+// Decodes a batch of mixed-format linear BCPack chunks (BC1, BC3, BC4, BC5, BC6H, BC7) in minimal GPU dispatches.
+// Groups items by pipeline family (BC1 fast-path vs BCN BC3/4/5, BC6H, BC7) and automatically sub-batches
+// within context capacity limits (max_chunks, max_blocks/max_output_bytes, max_stream_bytes).
+// Each item's result code is written to item->status (0 on success, < 0 on error without failing valid siblings).
+// Writes cumulative GPU kernel timestamp duration (ms) to *out_total_kernel_ms if non-NULL.
+// Returns count of items that succeeded (>= 0), or < 0 if ctx/items is invalid.
+BCPACK_API int32_t BcPackDecodeBatch(
+    BcPackContext*   ctx,
+    BcPackBatchItem* items,
+    uint32_t         count,
+    double*          out_total_kernel_ms);
 
 #ifdef __cplusplus
 }
