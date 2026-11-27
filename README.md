@@ -8,7 +8,7 @@
 
 **Standalone, bloat-free clean-room hardware GPU compute SDK (`MIT OR Apache-2.0`) for Xbox Series X|S translation layers, DirectStorage `IDStorageQueueX` hooks, Vulkan 1.3 Linux layers (`OpenScarlett` / Proton), and GPU backends for [`Ahmet-Dedeler/bcpack-rs`](https://github.com/Ahmet-Dedeler/bcpack-rs).**
 
-No game assets, no demo media bloat, zero copyrighted data — only the production C-ABI DLL (`bcpack_gpu.dll`), Rust crate (`bcpack-gpu-sdk` `v0.15.0`), `include/bcpack_gpu.h`, **15 HLSL SM 6.6 + DXIL compute kernels**, and **14 precompiled Vulkan 1.3 SPIR-V (`.spv`) kernels** supporting **all 6 BCPack formats: Full `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7)** with mixed-format GPU batching (`BcPackDecodeBatch`), batched zero-copy 2D texture streaming (`BcPackDecodeBatchToTextures`), and optional caller-supplied runtime table uploads.
+No game assets, no demo media bloat, zero copyrighted data — only the production C-ABI DLL (`bcpack_gpu.dll`), Rust crate (`bcpack-gpu-sdk` `v0.16.0`), `include/bcpack_gpu.h`, **16 HLSL SM 6.6 + DXIL compute kernels**, and **14 precompiled Vulkan 1.3 SPIR-V (`.spv`) kernels** supporting **all 6 BCPack formats: Full `BC1`, `BC3`, `BC4`, `BC5`, `BC6H` (Modes 1–14), and Multi-Mode `BC7` (Modes 0–7)** with mixed-format GPU batching (`BcPackDecodeBatch`), batched zero-copy 2D texture streaming (`BcPackDecodeBatchToTextures`), and optional caller-supplied runtime table uploads.
 
 > Looking for the full 4K streaming benchmark, 12.41M Mesh-Shader showcase, MP4/GIF captures, and 19-test verification harness? See the companion showcase repository: **[`POMXARK/bcpack-gpu-hlsl`](https://github.com/POMXARK/bcpack-gpu-hlsl)** (which links this SDK via Git submodule at `sdk/`).
 > AI coding agents & crawlers: read **[`llms.txt`](llms.txt)** and **[`docs/AI_ARCHITECTURE.md`](docs/AI_ARCHITECTURE.md)**.
@@ -82,7 +82,7 @@ All 9 core compute kernels are precompiled with official Microsoft `DirectXShade
 
 ```toml
 [dependencies]
-bcpack-gpu-sdk = { git = "https://github.com/POMXARK/bcpack-gpu-sdk.git", tag = "v0.14.1" }
+bcpack-gpu-sdk = { git = "https://github.com/POMXARK/bcpack-gpu-sdk.git", tag = "v0.16.0" }
 ```
 
 ```rust
