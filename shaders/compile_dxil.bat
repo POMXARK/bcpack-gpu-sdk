@@ -31,4 +31,5 @@ echo Using DXC: "%DXC%"
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0hiz_cull.dxil" "%~dp0hiz_cull.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_vrs.dxil" "%~dp0aaa_vrs.hlsl" || exit /b 1
 "%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0aaa_rtgi_cs.dxil" "%~dp0aaa_rtgi_cs.hlsl" || exit /b 1
+"%DXC%" -T cs_6_6 -E CSMain -HV 2021 -O3 -Fo "%~dp0scatter_patch.dxil" "%~dp0scatter_patch.hlsl" || exit /b 1
 echo SDK DXIL shaders compiled successfully.

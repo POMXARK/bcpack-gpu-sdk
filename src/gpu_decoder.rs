@@ -279,7 +279,7 @@ pub unsafe fn upload_slice<T: Copy>(res: &ID3D12Resource, data: &[T]) {
     res.Unmap(0, None);
 }
 
-unsafe fn create_root_sig_from_params(
+pub(crate) unsafe fn create_root_sig_from_params(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
 ) -> ID3D12RootSignature {
@@ -311,7 +311,7 @@ unsafe fn create_root_sig_from_params(
         .expect("CreateRootSignature")
 }
 
-unsafe fn create_compute_pso(
+pub(crate) unsafe fn create_compute_pso(
     device: &ID3D12Device,
     root_sig: &ID3D12RootSignature,
     dxil: &[u8],

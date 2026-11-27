@@ -1911,3 +1911,154 @@ pub unsafe extern "C" fn BcPackDecodeBatchToTextures(
     }));
     res.unwrap_or(-99)
 }
+
+// ---------------------------------------------------------------------------
+// Clean-Room Engine Primitives C-ABI Exports
+// ---------------------------------------------------------------------------
+
+use crate::primitives::{
+    diff_dirty_pages_64b, GpuScatterPatcher, HierarchicalDirtyBitmap, Wave32NanGuard,
+    SCATTER_SLOT_BYTES,
+};
+
+pub struct BcPackDirtyBitmap {
+    inner: HierarchicalDirtyBitmap,
+    indices: Vec<u32>,
+    data: Vec<u8>,
+}
+
+pub struct BcPackScatterPatcher {
+    inner: GpuScatterPatcher,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackDirtyBitmapCreate(num_pages: u32) -> *mut BcPackDirtyBitmap {
+    if num_pages == 0 {
+        return std::ptr::null_mut();
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        Box::into_raw(Box::new(BcPackDirtyBitmap {
+            inner: HierarchicalDirtyBitmap::new(num_pages as usize),
+            indices: Vec::new(),
+            data: Vec::new(),
+        }))
+    }));
+    res.unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackDirtyBitmapDestroy(bmp: *mut BcPackDirtyBitmap) {
+    if !bmp.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(bmp))));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackDirtyBitmapMarkRange(
+    bmp: *mut BcPackDirtyBitmap,
+    byte_offset: u64,
+    byte_len: u64,
+) {
+    if let Some(b) = bmp.as_mut() {
+        b.inner
+            .mark_byte_range(byte_offset as usize, byte_len as usize);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackDirtyBitmapDiff64B(
+    bmp: *mut BcPackDirtyBitmap,
+    src: *const u8,
+    shadow: *mut u8,
+    max_slots: u32,
+    out_indices: *mut u32,
+    out_data_64b: *mut u8,
+    max_out_patches: u32,
+) -> i32 {
+    if bmp.is_null() || src.is_null() || shadow.is_null() || max_slots == 0 {
+        return -1;
+    }
+    let b = &mut *bmp;
+    let total_bytes = (max_slots as usize).saturating_mul(SCATTER_SLOT_BYTES);
+    let src_slice = std::slice::from_raw_parts(src, total_bytes);
+    let shadow_slice = std::slice::from_raw_parts_mut(shadow, total_bytes);
+    diff_dirty_pages_64b(
+        &mut b.inner,
+        src_slice,
+        shadow_slice,
+        max_slots as usize,
+        &mut b.indices,
+        &mut b.data,
+    );
+    let count = b.indices.len().min(max_out_patches as usize);
+    if count > 0 {
+        if !out_indices.is_null() {
+            copy_nonoverlapping(b.indices.as_ptr(), out_indices, count);
+        }
+        if !out_data_64b.is_null() {
+            copy_nonoverlapping(b.data.as_ptr(), out_data_64b, count * SCATTER_SLOT_BYTES);
+        }
+    }
+    count as i32
+}
+
+#[no_mangle]
+pub extern "C" fn BcPackSanitizeFloat32(value: f32, strict_nan: i32) -> f32 {
+    Wave32NanGuard::sanitize_f32_cpu(value, strict_nan != 0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackScatterPatcherCreate(
+    d3d12_device: *mut c_void,
+    max_patches: u32,
+) -> *mut BcPackScatterPatcher {
+    if d3d12_device.is_null() {
+        return std::ptr::null_mut();
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let dev_ref: &ID3D12Device = std::mem::transmute(&d3d12_device);
+        let patcher = GpuScatterPatcher::new(dev_ref, max_patches.max(64) as usize).ok()?;
+        Some(Box::into_raw(Box::new(BcPackScatterPatcher { inner: patcher })))
+    }));
+    res.ok().flatten().unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackScatterPatcherDestroy(patcher: *mut BcPackScatterPatcher) {
+    if !patcher.is_null() {
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(patcher))));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn BcPackScatterPatcherRecord(
+    patcher: *mut BcPackScatterPatcher,
+    d3d12_cmd_list: *mut c_void,
+    dst_heap_resource: *mut c_void,
+    slot_indices: *const u32,
+    slot_data_64b: *const u8,
+    patch_count: u32,
+) -> i32 {
+    if patcher.is_null() || d3d12_cmd_list.is_null() || dst_heap_resource.is_null() {
+        return -1;
+    }
+    if patch_count == 0 {
+        return 0;
+    }
+    if slot_indices.is_null() || slot_data_64b.is_null() {
+        return -1;
+    }
+    let p = &*patcher;
+    let list_ref: &ID3D12GraphicsCommandList = std::mem::transmute(&d3d12_cmd_list);
+    let dst_ref: &ID3D12Resource = std::mem::transmute(&dst_heap_resource);
+    let idx_slice = std::slice::from_raw_parts(slot_indices, patch_count as usize);
+    let data_slice =
+        std::slice::from_raw_parts(slot_data_64b, (patch_count as usize) * SCATTER_SLOT_BYTES);
+    match p
+        .inner
+        .record_patch(list_ref, dst_ref, idx_slice, data_slice)
+    {
+        Ok(n) => n as i32,
+        Err(_) => -2,
+    }
+}

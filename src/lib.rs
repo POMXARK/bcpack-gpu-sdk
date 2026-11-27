@@ -10,3 +10,4 @@ pub mod crowd_skinning;
 pub mod descriptor_paging;
 pub mod ffi;
 pub mod gpu_decoder;
+pub mod primitives;

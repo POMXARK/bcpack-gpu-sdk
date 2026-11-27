@@ -214,6 +214,43 @@ BCPACK_API int32_t BcPackDecodeBatchToTextures(
     uint32_t                count,
     uint64_t*               out_direct_fence_value);
 
+// ---------------------------------------------------------------------------
+// Clean-Room Engine Primitives (Dirty Bitmap + GPU Scatter-Patch + NaN Guard)
+// ---------------------------------------------------------------------------
+
+typedef struct BcPackDirtyBitmap BcPackDirtyBitmap;
+typedef struct BcPackScatterPatcher BcPackScatterPatcher;
+
+BCPACK_API BcPackDirtyBitmap* BcPackDirtyBitmapCreate(uint32_t num_pages);
+BCPACK_API void BcPackDirtyBitmapDestroy(BcPackDirtyBitmap* bmp);
+BCPACK_API void BcPackDirtyBitmapMarkRange(
+    BcPackDirtyBitmap* bmp,
+    uint64_t           byte_offset,
+    uint64_t           byte_len);
+
+BCPACK_API int32_t BcPackDirtyBitmapDiff64B(
+    BcPackDirtyBitmap* bmp,
+    const uint8_t*     src,
+    uint8_t*           shadow,
+    uint32_t           max_slots,
+    uint32_t*          out_indices,
+    uint8_t*           out_data_64b,
+    uint32_t           max_out_patches);
+
+BCPACK_API float BcPackSanitizeFloat32(float value, int32_t strict_nan);
+
+BCPACK_API BcPackScatterPatcher* BcPackScatterPatcherCreate(
+    void*    d3d12_device,
+    uint32_t max_patches);
+BCPACK_API void BcPackScatterPatcherDestroy(BcPackScatterPatcher* patcher);
+BCPACK_API int32_t BcPackScatterPatcherRecord(
+    BcPackScatterPatcher* patcher,
+    void*                 d3d12_cmd_list,
+    void*                 dst_heap_resource,
+    const uint32_t*       slot_indices,
+    const uint8_t*        slot_data_64b,
+    uint32_t              patch_count);
+
 #ifdef __cplusplus
 }
 #endif
